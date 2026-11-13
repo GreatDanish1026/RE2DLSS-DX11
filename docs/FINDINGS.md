@@ -133,3 +133,14 @@ each applied within a fraction of a second. The game's post chain format changes
 - Mip bias -1.00 at 50%, -0.58 at 67%, 0 at 100%; 5 material samplers. It drops to 0 while the
   upscaler doesn't run (menus) and comes back after.
 - RCAS after DLSS ran.
+
+## Fixes after the 0.2.0 test (2026-11-13)
+
+- **Lights dimming below DLAA**: DLSS was told exposure 1.0; the TAA's colour is multiplied by
+  Exposure = WhitePtSrv[0] x exposureAdjustment (~0.05). exposure.hlsl computes it on the GPU from
+  the TAA's own inputs (VS t0, PS b1) for DLSS's exposure texture. User: better.
+- **Bloom fading toward Performance**: the bloom chain read the game's render-size TAA output,
+  which keeps less of small bright lights than DLSS. Now DLSS's 4K image is scaled down
+  (downsample.hlsl, 2x2 bilinear taps per pixel) into the TAA target and the game's TAA is skipped.
+- **Leon see-through until the bias changed**: a new sampler reusing a released sampler's address
+  kept the old biased copy. OnInitSampler now drops whatever was recorded for that handle.

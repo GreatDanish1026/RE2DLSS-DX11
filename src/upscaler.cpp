@@ -448,10 +448,19 @@ bool IsMaterialSampler(const sampler_desc& d) {
            d.address_u == texture_address_mode::wrap && d.max_lod > d.min_lod;
 }
 
-void OnInitSampler(device*, const sampler_desc& d, sampler s) {
-    if (!IsMaterialSampler(d)) return;
+// A new sampler can reuse the address of one the game released: whatever was recorded for that
+// handle (and our biased copy of it) belongs to the old one and goes. (0.2.0 kept the old copy:
+// the game then sampled with the wrong sampler, and Leon's dithered fade turned see-through until
+// the bias changed.)
+void OnInitSampler(device* dev, const sampler_desc& d, sampler s) {
     std::lock_guard<std::mutex> lock(g_samplerMutex);
-    g_materialSamplers[s.handle] = d;
+    auto b = g_biased.find(s.handle);
+    if (b != g_biased.end()) {
+        dev->destroy_sampler(b->second);
+        g_biased.erase(b);
+    }
+    if (IsMaterialSampler(d)) g_materialSamplers[s.handle] = d;
+    else g_materialSamplers.erase(s.handle);
 }
 
 void OnDestroySampler(device* dev, sampler s) {
