@@ -122,3 +122,14 @@ each applied within a fraction of a second. The game's post chain format changes
 - **Sharper textures**: D3D11 samplers can't be rewritten, so after each PSSetSamplers the game's
   material samplers (anisotropic/trilinear, wrap, with mips) are rebound as copies with
   mip bias log2(render scale), made once per bias; follows the render scale live.
+
+## 0.2.0 test (2026-11-13)
+
+- FSR through the bridge works once the shared textures are made by D3D11 (MISC_SHARED |
+  SHARED_NTHANDLE, opened with ID3D12Device::OpenSharedHandle); D3D12-made shared textures opened by
+  D3D11 failed with E_INVALIDARG. FSR 3.1.6 (RTX 5080) ran at 50%, 100% (native AA) and 67%.
+- The game binds an 8x8 placeholder (format 72) as the velocity on the first frame and the first
+  after a menu: those frames are left to the game's TAA now.
+- Mip bias -1.00 at 50%, -0.58 at 67%, 0 at 100%; 5 material samplers. It drops to 0 while the
+  upscaler doesn't run (menus) and comes back after.
+- RCAS after DLSS ran.

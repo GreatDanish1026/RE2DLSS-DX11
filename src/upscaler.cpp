@@ -445,6 +445,16 @@ bool OnTaa(command_list* cl, const GameState& g) {
     }
     const resource_desc cd = dev->get_resource_desc(color);
     const resource_desc td = dev->get_resource_desc(target);
+    // On the first frame (and the first after a menu) the game binds an 8x8 placeholder as the
+    // velocity: the game's TAA handles that frame.
+    const resource_desc md = dev->get_resource_desc(motion);
+    if (md.texture.width != cd.texture.width || md.texture.height != cd.texture.height) {
+        static int logged = 0;
+        if (logged++ < 3)
+            Log("a frame without motion vectors (velocity %ux%u, colour %ux%u): the game's TAA used", md.texture.width,
+                md.texture.height, cd.texture.width, cd.texture.height);
+        return false;
+    }
     uint32_t renderW = cd.texture.width, renderH = cd.texture.height;
     const float sw = scene[kScreenSize], sh = scene[kScreenSize + 1];
     if (sw >= 64 && sh >= 64 && sw <= renderW && sh <= renderH) renderW = static_cast<uint32_t>(sw), renderH = static_cast<uint32_t>(sh);
