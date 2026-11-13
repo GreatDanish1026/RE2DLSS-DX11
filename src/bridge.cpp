@@ -77,28 +77,38 @@ bool Ensure(Shared& s, UINT w, UINT h, DXGI_FORMAT fmt, bool uav, const char* na
     if (s.r12 && s.w == w && s.h == h && s.fmt == fmt) return true;
     WaitIdle();
     Free(s);
-    D3D12_HEAP_PROPERTIES heap = {D3D12_HEAP_TYPE_DEFAULT};
-    D3D12_RESOURCE_DESC d = {};
-    d.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
-    d.Width = w, d.Height = h, d.DepthOrArraySize = 1, d.MipLevels = 1;
+    // Made by Direct3D 11 as a shared (NT handle) texture and opened by Direct3D 12: the usual way
+    // round (D3D12-made shared textures opened by D3D11 failed with E_INVALIDARG in 0.2.0).
+    D3D11_TEXTURE2D_DESC d = {};
+    d.Width = w, d.Height = h, d.MipLevels = 1, d.ArraySize = 1;
     d.Format = fmt;
     d.SampleDesc.Count = 1;
-    d.Layout = D3D12_TEXTURE_LAYOUT_UNKNOWN;
-    d.Flags = (uav ? D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS : D3D12_RESOURCE_FLAG_NONE) |
-              (renderTarget ? D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET : D3D12_RESOURCE_FLAG_NONE);
-    HRESULT hr = g_d12->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_SHARED, &d, D3D12_RESOURCE_STATE_COMMON, nullptr,
-                                                IID_PPV_ARGS(&s.r12));
+    d.Usage = D3D11_USAGE_DEFAULT;
+    d.BindFlags = D3D11_BIND_SHADER_RESOURCE | (uav ? D3D11_BIND_UNORDERED_ACCESS : 0) |
+                  (renderTarget ? D3D11_BIND_RENDER_TARGET : 0);
+    d.MiscFlags = D3D11_RESOURCE_MISC_SHARED | D3D11_RESOURCE_MISC_SHARED_NTHANDLE;
+    ID3D11Texture2D* t = nullptr;
+    const char* step = "CreateTexture2D";
+    HRESULT hr = g_d11->CreateTexture2D(&d, nullptr, &t);
+    IDXGIResource1* dxgi = nullptr;
     HANDLE handle = nullptr;
-    if (SUCCEEDED(hr)) hr = g_d12->CreateSharedHandle(s.r12, nullptr, GENERIC_ALL, nullptr, &handle);
-    if (SUCCEEDED(hr)) hr = g_d11->OpenSharedResource1(handle, IID_PPV_ARGS(&s.r11));
+    if (SUCCEEDED(hr)) step = "IDXGIResource1", hr = t->QueryInterface(IID_PPV_ARGS(&dxgi));
+    if (SUCCEEDED(hr))
+        step = "CreateSharedHandle",
+        hr = dxgi->CreateSharedHandle(nullptr, DXGI_SHARED_RESOURCE_READ | DXGI_SHARED_RESOURCE_WRITE, nullptr, &handle);
+    if (SUCCEEDED(hr)) step = "OpenSharedHandle", hr = g_d12->OpenSharedHandle(handle, IID_PPV_ARGS(&s.r12));
+    SafeRelease(dxgi);
     if (handle) CloseHandle(handle);
+    s.r11 = t;
     if (FAILED(hr)) {
         Free(s);
-        char buf[160];
-        snprintf(buf, sizeof(buf), "couldn't share the %ux%u %s texture (format %u) with Direct3D 12 (0x%08lx)", w, h, name,
-                 static_cast<unsigned>(fmt), static_cast<unsigned long>(hr));
+        char buf[200];
+        snprintf(buf, sizeof(buf), "couldn't share the %ux%u %s texture (format %u) with Direct3D 12: %s failed (0x%08lx)", w,
+                 h, name, static_cast<unsigned>(fmt), step, static_cast<unsigned long>(hr));
         error = buf;
-        rd::Log("%s", buf);
+        rd::Log("FSR bridge: %s", buf);
+        g_ready = false;  // don't try again every frame
+        g_initError = g_status = buf;
         return false;
     }
     s.w = w, s.h = h, s.fmt = fmt;
@@ -196,7 +206,10 @@ ID3D11RenderTargetView* DepthTarget(unsigned w, unsigned h, std::string& error) 
     }
     if (g_depth.r12 && g_depth.w == w && g_depth.h == h && g_depthRtv) return g_depthRtv;
     SafeRelease(g_depthRtv);
-    if (!Ensure(g_depth, w, h, DXGI_FORMAT_R32_FLOAT, false, "depth", error, true)) return nullptr;
+    if (!Ensure(g_depth, w, h, DXGI_FORMAT_R32_FLOAT, false, "depth", error, true)) {
+        error = g_initError;
+        return nullptr;
+    }
     if (FAILED(g_d11->CreateRenderTargetView(g_depth.r11, nullptr, &g_depthRtv))) {
         error = "couldn't make a render target of the shared depth texture";
         return nullptr;
