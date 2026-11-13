@@ -493,6 +493,10 @@ void OnBindPipeline(command_list* cl, pipeline_stage stages, pipeline pipe) {
 }
 
 void OnPushDescriptors(command_list* cl, shader_stage stages, pipeline_layout, uint32_t, const descriptor_table_update& u) {
+    if (u.type == descriptor_type::sampler) {
+        rd::UpscalerOnSamplers(cl, stages, u);  // material samplers -> copies with the mip bias
+        return;
+    }
     std::lock_guard<std::mutex> lock(g_ctxMutex);
     Context& c = Ctx(cl);
     Stage* st = StageOf(c, stages);

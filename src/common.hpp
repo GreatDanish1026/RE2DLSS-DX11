@@ -50,6 +50,9 @@ void UpscalerShutdown();
 void UpscalerDestroyDevice(reshade::api::device* dev);
 bool UpscalerOnDraw(reshade::api::command_list* cl, uint32_t vertices, uint32_t instances);  // true: draw skipped
 void UpscalerBeforeWork(reshade::api::command_list* cl);  // any other GPU work: puts redirected state back
+// After the game binds samplers (D3D11 PSSetSamplers): material samplers swapped for biased copies.
+void UpscalerOnSamplers(reshade::api::command_list* cl, reshade::api::shader_stage stages,
+                        const reshade::api::descriptor_table_update& u);
 void UpscalerPresent(reshade::api::command_queue* q, reshade::api::swapchain* sc);
 void UpscalerOverlay();
 

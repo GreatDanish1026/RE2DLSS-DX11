@@ -42,6 +42,8 @@
 
 #include "blit_ps.h"  // kBlitPs, kBlitVs: blit.hlsl compiled by build.ps1
 #include "blit_vs.h"
+#include "rcas_cs.h"  // kRcasCs: rcas.hlsl
+#include "bridge.hpp"
 #include "dlss.hpp"
 #include "version.h"
 
@@ -65,6 +67,7 @@ constexpr int kViewProj = 0;            // row_major float4x4, byte 0
 constexpr int kProjElement0 = 40;       // byte 160: x scale, y scale, jitter x, jitter y (clip space)
 constexpr int kPrevViewProj = 72;       // byte 288
 constexpr int kScreenSize = 92;         // byte 368: width, height, 1 / width, 1 / height
+constexpr int kNearPlane = 98;          // byte 392: cameraNearPlane
 constexpr int kSceneInfoFloats = 128;   // 512 bytes
 
 // ---------------------------------------------------------------- settings
@@ -76,6 +79,9 @@ struct Settings {
     bool sharpen = true;       // the game's sharpening at output size when upscaling
     bool gameExposure = true;  // DLSS gets exposure 1.0 (the TAA's colour) instead of guessing it
     bool effectMask = true;    // DLSS gets the TAA's effect mask (particles, effects)
+    bool textureDetail = true; // material samplers get a mip bias of log2(render scale) when upscaling
+    float sharpness = 0;       // extra sharpening after DLSS (RCAS), or FSR's own; 0 = off
+    int upscaler = 0;          // Tech: 0 Auto (DLSS where NGX runs, else FSR), 1 DLSS, 2 FSR
     bool flipJitterX = false, flipJitterY = false;
     int mode = 0;  // render resolution through RE2DLSS-DX11.lua (0: the game's Image Quality slider)
 } g_set;
@@ -111,6 +117,11 @@ void LoadSettings() {
     reshade::get_config_value(nullptr, RD_PRODUCT, "GameSharpening", g_set.sharpen);
     reshade::get_config_value(nullptr, RD_PRODUCT, "GameExposure", g_set.gameExposure);
     reshade::get_config_value(nullptr, RD_PRODUCT, "EffectMask", g_set.effectMask);
+    reshade::get_config_value(nullptr, RD_PRODUCT, "TextureDetail", g_set.textureDetail);
+    reshade::get_config_value(nullptr, RD_PRODUCT, "Sharpness", g_set.sharpness);
+    if (!(g_set.sharpness >= 0 && g_set.sharpness <= 1)) g_set.sharpness = 0;
+    reshade::get_config_value(nullptr, RD_PRODUCT, "Upscaler", g_set.upscaler);
+    if (g_set.upscaler < 0 || g_set.upscaler > 2) g_set.upscaler = 0;
     reshade::get_config_value(nullptr, RD_PRODUCT, "Mode", g_set.mode);
     if (g_set.mode < 0 || g_set.mode >= kModeCount) g_set.mode = 0;
 }
@@ -123,6 +134,9 @@ void SaveSettings() {
     reshade::set_config_value(nullptr, RD_PRODUCT, "Mode", g_set.mode);
     reshade::set_config_value(nullptr, RD_PRODUCT, "GameExposure", g_set.gameExposure);
     reshade::set_config_value(nullptr, RD_PRODUCT, "EffectMask", g_set.effectMask);
+    reshade::set_config_value(nullptr, RD_PRODUCT, "TextureDetail", g_set.textureDetail);
+    reshade::set_config_value(nullptr, RD_PRODUCT, "Sharpness", g_set.sharpness);
+    reshade::set_config_value(nullptr, RD_PRODUCT, "Upscaler", g_set.upscaler);
 }
 
 // ---------------------------------------------------------------- status
@@ -259,6 +273,88 @@ bool Blit(command_list* cl, resource_view src, resource_view dst, uint32_t w, ui
     return true;
 }
 
+// ---------------------------------------------------------------- sharpening (RCAS)
+//
+// With the Sharpening slider above 0, DLSS writes into Xs and AMD's RCAS (rcas.hlsl) writes the
+// sharpened image into X, where DLSS's output normally goes. FSR uses its own RCAS.
+
+Texture g_xs;  // DLSS's output before sharpening
+ID3D11ComputeShader* g_rcasCs = nullptr;
+ID3D11Buffer* g_rcasCb = nullptr;
+bool g_rcasFailed = false;
+
+bool Sharpen(command_list* cl, Texture& src, Texture& dst, float sharpness) {
+    auto* d3d = reinterpret_cast<ID3D11Device*>(cl->get_device()->get_native());
+    if (!BlitReady(d3d)) return false;
+    if (!g_rcasCs && !g_rcasFailed) {
+        d3d->CreateComputeShader(kRcasCs, sizeof(kRcasCs), nullptr, &g_rcasCs);
+        D3D11_BUFFER_DESC bd = {32, D3D11_USAGE_DEFAULT, D3D11_BIND_CONSTANT_BUFFER, 0, 0, 0};
+        d3d->CreateBuffer(&bd, nullptr, &g_rcasCb);
+        g_rcasFailed = !g_rcasCs || !g_rcasCb;
+        Log(g_rcasFailed ? "couldn't create the sharpening shader" : "sharpening shader (RCAS) created");
+    }
+    if (g_rcasFailed || !src.srv.handle || !dst.uav.handle) return false;
+    auto* ctx = reinterpret_cast<ID3D11DeviceContext*>(cl->get_native());
+    ID3D11DeviceContext1* ctx1 = nullptr;
+    if (FAILED(ctx->QueryInterface(__uuidof(ID3D11DeviceContext1), reinterpret_cast<void**>(&ctx1)))) return false;
+    ID3DDeviceContextState* game = nullptr;
+    ctx1->SwapDeviceContextState(g_cleanState, &game);
+    ctx1->ClearState();
+    uint32_t params[8] = {};
+    memcpy(&params[0], &sharpness, 4);
+    params[4] = dst.w, params[5] = dst.h;
+    ctx1->UpdateSubresource(g_rcasCb, 0, nullptr, params, 0, 0);
+    auto* srv = reinterpret_cast<ID3D11ShaderResourceView*>(src.srv.handle);
+    auto* uav = reinterpret_cast<ID3D11UnorderedAccessView*>(dst.uav.handle);
+    ctx1->CSSetShader(g_rcasCs, nullptr, 0);
+    ctx1->CSSetConstantBuffers(0, 1, &g_rcasCb);
+    ctx1->CSSetShaderResources(0, 1, &srv);
+    ctx1->CSSetUnorderedAccessViews(0, 1, &uav, nullptr);
+    ctx1->Dispatch((dst.w + 7) / 8, (dst.h + 7) / 8, 1);
+    ctx1->ClearState();
+    ctx1->SwapDeviceContextState(game, nullptr);
+    if (game) game->Release();
+    ctx1->Release();
+    static bool logged = false;
+    if (!logged) logged = true, Log("upscaled image sharpened (RCAS, strength %.2f)", sharpness);
+    return true;
+}
+
+// ---------------------------------------------------------------- texture detail (mip bias)
+//
+// At a lower render size the GPU picks smaller mip levels, so textures look blurrier than at
+// native. DLSS's guidance: a mip bias of log2(render width / output width). D3D11 sampler objects
+// can't be changed, so each material sampler (anisotropic or trilinear, wrapping, with mips) the
+// game binds is followed by a copy of it with the bias, made once per bias. The bias follows the
+// render scale as it changes.
+
+std::mutex g_samplerMutex;
+std::map<uint64_t, sampler_desc> g_materialSamplers;  // the game's, by handle
+std::map<uint64_t, sampler> g_biased;                 // the game's -> ours at g_biasMade
+float g_biasMade = 0;
+std::atomic<float> g_mipBias{0};
+
+bool IsMaterialSampler(const sampler_desc& d) {
+    return (d.filter == filter_mode::anisotropic || d.filter == filter_mode::min_mag_mip_linear) &&
+           d.address_u == texture_address_mode::wrap && d.max_lod > d.min_lod;
+}
+
+void OnInitSampler(device*, const sampler_desc& d, sampler s) {
+    if (!IsMaterialSampler(d)) return;
+    std::lock_guard<std::mutex> lock(g_samplerMutex);
+    g_materialSamplers[s.handle] = d;
+}
+
+void OnDestroySampler(device* dev, sampler s) {
+    std::lock_guard<std::mutex> lock(g_samplerMutex);
+    g_materialSamplers.erase(s.handle);
+    auto it = g_biased.find(s.handle);
+    if (it != g_biased.end()) {
+        dev->destroy_sampler(it->second);
+        g_biased.erase(it);
+    }
+}
+
 // ---------------------------------------------------------------- upscaling state
 
 struct Up {
@@ -268,6 +364,10 @@ struct Up {
     Texture* final = nullptr;
 } g_up;
 bool g_restorePending = false;  // the game's bindings were changed for its draw: put back next
+
+enum class Tech { Auto = 0, Dlss = 1, Fsr = 2 };
+Tech g_active = Tech::Auto;  // the upscaler that ran last
+bool g_lastUpscale = false;  // the last run upscaled (below 100%)
 
 std::atomic<float> g_renderScale{1};
 
@@ -350,38 +450,85 @@ bool OnTaa(command_list* cl, const GameState& g) {
     if (sw >= 64 && sh >= 64 && sw <= renderW && sh <= renderH) renderW = static_cast<uint32_t>(sw), renderH = static_cast<uint32_t>(sh);
     g_renderScale = g_outW ? static_cast<float>(renderW) / g_outW : 1.0f;
 
+    // Which upscaler: Auto takes DLSS when NGX starts (RTX cards), FSR otherwise.
+    auto* d3d = reinterpret_cast<ID3D11Device*>(dev->get_native());
     std::string err;
-    if (!dlss::Init(reinterpret_cast<ID3D11Device*>(dev->get_native()), err)) {
+    Tech tech = static_cast<Tech>(g_set.upscaler);
+    if (tech == Tech::Auto) {
+        std::string dlssErr;
+        tech = dlss::Init(d3d, dlssErr) ? Tech::Dlss : Tech::Fsr;
+    }
+    if (tech == Tech::Dlss ? !dlss::Init(d3d, err) : !bridge::Init(d3d, err)) {
         Fail(err);
         return false;
     }
+    if (tech != g_active) {
+        if (g_active == Tech::Dlss) dlss::ReleaseFeatures();
+        Log("Upscaler: %s", tech == Tech::Dlss ? "DLSS" : "FSR");
+        g_active = tech;
+    }
+
     const bool upscale = g_set.upscale && g_outW && g_outH && renderW < g_outW && renderH < g_outH &&
                          renderW * 3 + 16 >= g_outW && renderH * 3 + 16 >= g_outH;
     const uint32_t outW = upscale ? g_outW : td.texture.width, outH = upscale ? g_outH : td.texture.height;
-    if (!Ensure(dev, g_x, outW, outH, format::r16g16b16a16_float, true, "DLSS output")) {
-        Fail("no DLSS output texture");
+    if (!Ensure(dev, g_x, outW, outH, format::r16g16b16a16_float, true, "upscaler output")) {
+        Fail("no upscaler output texture");
         return false;
     }
-
-    dlss::Inputs in;
-    in.color = reinterpret_cast<ID3D11Resource*>(color.handle);
-    in.depth = reinterpret_cast<ID3D11Resource*>(depth.handle);
-    in.motion = reinterpret_cast<ID3D11Resource*>(motion.handle);
-    in.output = reinterpret_cast<ID3D11Resource*>(g_x.res.handle);
-    in.renderWidth = renderW, in.renderHeight = renderH;
-    in.outputWidth = outW, in.outputHeight = outH;
+    const bool sharpenDlss = tech == Tech::Dlss && g_set.sharpness >= 0.005f &&
+                             Ensure(dev, g_xs, outW, outH, format::r16g16b16a16_float, true, "DLSS output before sharpening");
     const float jitterX = JitterX(scene, renderW), jitterY = JitterY(scene, renderH);
-    in.jitterX = jitterX, in.jitterY = jitterY;
-    in.motionScaleX = 0.5f * renderW;  // NDC offsets, y up -> render pixels, y down
-    in.motionScaleY = -0.5f * renderH;
-    in.exposure = ExposureOne(dev);
-    in.biasMask = g_set.effectMask && mask.handle ? reinterpret_cast<ID3D11Resource*>(mask.handle) : nullptr;
-    in.reset = CameraCut(scene);
-    in.preset = g_set.preset;
-    if (!dlss::Evaluate(reinterpret_cast<ID3D11DeviceContext*>(cl->get_native()), in, err)) {
-        Fail(err);
-        return false;
+    const bool reset = CameraCut(scene);
+    auto* ctx = reinterpret_cast<ID3D11DeviceContext*>(cl->get_native());
+
+    if (tech == Tech::Dlss) {
+        dlss::Inputs in;
+        in.color = reinterpret_cast<ID3D11Resource*>(color.handle);
+        in.depth = reinterpret_cast<ID3D11Resource*>(depth.handle);
+        in.motion = reinterpret_cast<ID3D11Resource*>(motion.handle);
+        in.output = reinterpret_cast<ID3D11Resource*>((sharpenDlss ? g_xs : g_x).res.handle);
+        in.renderWidth = renderW, in.renderHeight = renderH;
+        in.outputWidth = outW, in.outputHeight = outH;
+        in.jitterX = jitterX, in.jitterY = jitterY;
+        in.motionScaleX = 0.5f * renderW;  // NDC offsets, y up -> render pixels, y down
+        in.motionScaleY = -0.5f * renderH;
+        in.exposure = ExposureOne(dev);
+        in.biasMask = g_set.effectMask && mask.handle ? reinterpret_cast<ID3D11Resource*>(mask.handle) : nullptr;
+        in.reset = reset;
+        in.preset = g_set.preset;
+        if (!dlss::Evaluate(ctx, in, err)) {
+            Fail(err);
+            return false;
+        }
+        if (sharpenDlss) Sharpen(cl, g_xs, g_x, g_set.sharpness);
+    } else {
+        // FSR runs on Direct3D 12: the depth is drawn into the shared r32f texture first.
+        ID3D11RenderTargetView* depthRtv = bridge::DepthTarget(renderW, renderH, err);
+        if (!depthRtv || !Blit(cl, g.psSrv[kTaaDepth], resource_view{reinterpret_cast<uint64_t>(depthRtv)}, renderW, renderH)) {
+            Fail(err.empty() ? "couldn't copy the depth for FSR" : err);
+            return false;
+        }
+        bridge::Inputs in;
+        in.color = reinterpret_cast<ID3D11Resource*>(color.handle);
+        in.motion = reinterpret_cast<ID3D11Resource*>(motion.handle);
+        in.reactive = g_set.effectMask && mask.handle ? reinterpret_cast<ID3D11Resource*>(mask.handle) : nullptr;
+        in.output = reinterpret_cast<ID3D11Resource*>(g_x.res.handle);
+        in.renderWidth = renderW, in.renderHeight = renderH;
+        in.outputWidth = outW, in.outputHeight = outH;
+        in.jitterX = jitterX, in.jitterY = jitterY;
+        in.motionScaleX = 0.5f * renderW;
+        in.motionScaleY = -0.5f * renderH;
+        const float nearZ = scene[kNearPlane], yScale = scene[kProjElement0 + 1];
+        in.cameraNear = nearZ > 0 && nearZ < 10 ? nearZ : 0.01f;
+        in.cameraFovY = yScale > 0.05f ? 2 * std::atan(1 / yScale) : 1.0f;
+        in.sharpness = g_set.sharpness;
+        in.reset = reset;
+        if (!bridge::Evaluate(ctx, in, err)) {
+            Fail(err);
+            return false;
+        }
     }
+    g_lastUpscale = upscale;
 
     bool skip;
     if (upscale) {
@@ -400,12 +547,14 @@ bool OnTaa(command_list* cl, const GameState& g) {
         skip = true;
     }
 
-    const std::string mode = upscale ? std::to_string(renderW) + "x" + std::to_string(renderH) + " -> " +
-                                           std::to_string(outW) + "x" + std::to_string(outH)
-                                     : "DLAA " + std::to_string(renderW) + "x" + std::to_string(renderH);
+    const std::string mode = std::string(tech == Tech::Dlss ? "DLSS " : "FSR ") +
+                             (upscale ? std::to_string(renderW) + "x" + std::to_string(renderH) + " -> " +
+                                            std::to_string(outW) + "x" + std::to_string(outH)
+                                      : (tech == Tech::Dlss ? "DLAA " : "native AA ") + std::to_string(renderW) + "x" +
+                                            std::to_string(renderH));
     std::lock_guard<std::mutex> lock(g_statusMutex);
     if (!g_runs++ || !g_lastError.empty() || mode != g_mode)
-        Log("DLSS running: %s, jitter %.3f %.3f px%s", mode.c_str(), jitterX, jitterY, in.reset ? ", reset" : "");
+        Log("Upscaler running: %s, jitter %.3f %.3f px%s", mode.c_str(), jitterX, jitterY, reset ? ", reset" : "");
     g_mode = mode;
     g_lastError.clear();
     g_lastRun = g_frame + 1;
@@ -546,15 +695,71 @@ void Help(const char* text) {
 
 void UpscalerInit() {
     LoadSettings();
-    Log("Upscaling %s at start (F9 toggles)", g_set.enabled ? "on" : "off");
+    Log("Upscaling %s at start (F9 toggles), upscaler setting %d (0 auto, 1 DLSS, 2 FSR)", g_set.enabled ? "on" : "off",
+        g_set.upscaler);
+    reshade::register_event<reshade::addon_event::init_sampler>(&OnInitSampler);
+    reshade::register_event<reshade::addon_event::destroy_sampler>(&OnDestroySampler);
 }
 
-void UpscalerShutdown() { dlss::Shutdown(); }
+void UpscalerShutdown() {
+    reshade::unregister_event<reshade::addon_event::init_sampler>(&OnInitSampler);
+    reshade::unregister_event<reshade::addon_event::destroy_sampler>(&OnDestroySampler);
+    dlss::Shutdown();
+    bridge::Shutdown();
+}
+
+// After the game binds samplers: its material ones are replaced by copies with the mip bias.
+void UpscalerOnSamplers(command_list* cl, shader_stage stages, const descriptor_table_update& u) {
+    const float bias = g_mipBias.load();
+    if (bias == 0 || (stages & shader_stage::pixel) == 0 || !u.count) return;
+    sampler repl[16];
+    const uint32_t n = u.count < 16 ? u.count : 16;
+    bool any = false;
+    device* dev = cl->get_device();
+    {
+        std::lock_guard<std::mutex> lock(g_samplerMutex);
+        if (g_biasMade != bias) {
+            for (auto& [game, ours] : g_biased) dev->destroy_sampler(ours);
+            g_biased.clear();
+            g_biasMade = bias;
+        }
+        for (uint32_t i = 0; i < n; ++i) {
+            repl[i] = static_cast<const sampler*>(u.descriptors)[i];
+            auto m = g_materialSamplers.find(repl[i].handle);
+            if (m == g_materialSamplers.end()) continue;
+            auto b = g_biased.find(repl[i].handle);
+            if (b == g_biased.end()) {
+                sampler_desc d = m->second;
+                d.mip_lod_bias += bias;
+                sampler s = {0};
+                if (!dev->create_sampler(d, &s)) continue;
+                b = g_biased.emplace(repl[i].handle, s).first;
+            }
+            repl[i] = b->second;
+            any = true;
+        }
+    }
+    if (!any) return;
+    descriptor_table_update r = u;
+    r.count = n;
+    r.descriptors = repl;
+    cl->push_descriptors(shader_stage::pixel, pipeline_layout{0}, 0, r);
+}
 
 void UpscalerDestroyDevice(device* dev) {
     if (dev != g_dev && g_dev) return;
     g_dev = dev;
-    for (Texture* t : {&g_x, &g_y, &g_z}) Free(*t);
+    bridge::Shutdown();
+    {
+        std::lock_guard<std::mutex> lock(g_samplerMutex);
+        for (auto& [game, ours] : g_biased) dev->destroy_sampler(ours);
+        g_biased.clear();
+        g_materialSamplers.clear();
+    }
+    if (g_rcasCs) g_rcasCs->Release();
+    if (g_rcasCb) g_rcasCb->Release();
+    g_rcasCs = nullptr, g_rcasCb = nullptr;
+    for (Texture* t : {&g_x, &g_xs, &g_y, &g_z}) Free(*t);
     if (g_exposureOne.handle) dev->destroy_resource(g_exposureOne);
     if (g_sceneCb.handle) dev->destroy_resource(g_sceneCb);
     g_exposureOne = g_sceneCb = {0};
@@ -613,6 +818,21 @@ void UpscalerPresent(command_queue* q, swapchain* sc) {
     }
     g_keyWasDown = down;
     if (g_frame % 30 == 0) WriteWantedScale();  // also picks up REFramework installed after the start
+    bridge::EndFrame();
+
+    // Texture mip bias: log2 of the render scale while upscaling ran in the last second or so.
+    const bool upscaling = g_set.enabled && g_lastUpscale && g_lastRun + 60 >= g_frame && g_lastRun;
+    const float scale = g_renderScale.load();
+    const float want = upscaling && g_set.textureDetail && scale < 0.99f && scale > 0.2f ? std::log2(scale) : 0.0f;
+    if (std::fabs(want - g_mipBias.load()) >= 0.05f || (want == 0 && g_mipBias.load() != 0)) {
+        g_mipBias = want;
+        size_t n;
+        {
+            std::lock_guard<std::mutex> lock(g_samplerMutex);
+            n = g_materialSamplers.size();
+        }
+        Log("texture mip bias now %.2f (render scale %.2f, %zu material samplers seen)", want, scale, n);
+    }
     (void)q;
 }
 
@@ -622,8 +842,18 @@ void UpscalerOverlay() {
     if (ImGui::BeginTabBar("##tabs")) {
         if (ImGui::BeginTabItem("Settings")) {
             changed |= ImGui::Checkbox("Upscaling (F9)", &g_set.enabled);
-            Help("DLSS in place of the game's TAA. 100% render resolution gives DLAA (native resolution), lower "
-                 "values are upscaled to the screen by DLSS.");
+            Help("DLSS or FSR in place of the game's TAA. 100% render resolution gives native anti-aliasing (DLAA), "
+                 "lower values are upscaled to the screen.");
+            {
+                const char* techs[] = {"Auto", "DLSS", "FSR 3.1 / FSR 4"};
+                ImGui::SetNextItemWidth(ControlWidth());
+                if (ImGui::Combo("Upscaler", &g_set.upscaler, techs, 3)) {
+                    changed = true;
+                    Log("Upscaler setting: %s", techs[g_set.upscaler]);
+                }
+                Help("Auto: DLSS on NVIDIA RTX cards, FSR on others.\nFSR runs through Direct3D 12 next to the game "
+                     "(AMD's runtime is Direct3D 12 only); it picks FSR 4 on Radeon cards that support it.");
+            }
             const char* modeNames[kModeCount];
             for (int i = 0; i < kModeCount; ++i) modeNames[i] = kModes[i].name;
             ImGui::SetNextItemWidth(ControlWidth());
@@ -650,12 +880,18 @@ void UpscalerOverlay() {
                 if (kPresets[i].value == g_set.preset) idx = i;
             const char* names[kPresetCount];
             for (int i = 0; i < kPresetCount; ++i) names[i] = kPresets[i].name;
+            ImGui::BeginDisabled(g_set.upscaler == 2 || (g_set.upscaler == 0 && g_active == Tech::Fsr));
             ImGui::SetNextItemWidth(ControlWidth());
             if (ImGui::Combo("DLSS model", &idx, names, kPresetCount)) {
                 g_set.preset = kPresets[idx].value;
                 changed = true;
             }
+            ImGui::EndDisabled();
             Help("Automatic: K at higher render scales, M around 50%, L at 33% (NVIDIA's recommendation).");
+            ImGui::SetNextItemWidth(ControlWidth());
+            changed |= ImGui::SliderFloat("Sharpening", &g_set.sharpness, 0.0f, 1.0f, g_set.sharpness < 0.005f ? "Off" : "%.2f");
+            Help("Extra sharpening of the upscaled image (AMD's RCAS, contrast-adaptive: crisper edges without halos). "
+                 "0 = off. For DLSS it runs after it; for FSR it's FSR's own.");
             ImGui::EndTabItem();
         }
         if (ImGui::BeginTabItem("Status")) {
@@ -666,10 +902,12 @@ void UpscalerOverlay() {
                 err = g_lastError, mode = g_mode;
             }
             if (!g_set.enabled) ImGui::TextUnformatted("Upscaling off (F9)");
-            else if (running) ImGui::Text("DLSS %s", mode.c_str());
+            else if (running) ImGui::Text("%s", mode.c_str());
             else ImGui::TextColored(kWarn, "Not upscaling%s%s", err.empty() ? "" : ": ", err.c_str());
-            ImGui::TextDisabled("DLSS: %s", dlss::Status().c_str());
+            if (g_active != Tech::Fsr) ImGui::TextDisabled("DLSS: %s", dlss::Status().c_str());
+            if (g_active == Tech::Fsr || g_set.upscaler == 2) ImGui::TextDisabled("FSR: %s", bridge::Status().c_str());
             ImGui::TextDisabled("Output %ux%u, render scale %.0f%%", g_outW, g_outH, g_renderScale.load() * 100);
+            ImGui::TextDisabled("Texture mip bias %.2f", g_mipBias.load());
             ImGui::EndTabItem();
         }
         if (ImGui::BeginTabItem("Advanced")) {
@@ -681,7 +919,10 @@ void UpscalerOverlay() {
             changed |= ImGui::Checkbox("Use the game's exposure", &g_set.gameExposure);
             Help("DLSS is told the colour's exposure instead of estimating it: steadier brightness.");
             changed |= ImGui::Checkbox("Use the game's effect mask", &g_set.effectMask);
-            Help("The mask the game's TAA uses for particles and effects: DLSS trusts the current frame more there.");
+            Help("The mask the game's TAA uses for particles and effects: DLSS and FSR trust the current frame more there.");
+            changed |= ImGui::Checkbox("Sharper textures", &g_set.textureDetail);
+            Help("When upscaling, textures are sampled as at the output resolution (mip bias log2 of the render scale, "
+                 "as NVIDIA recommends). Follows the render resolution as it changes.");
             ImGui::SeparatorText("Development");
             changed |= ImGui::Checkbox("Flip jitter X", &g_set.flipJitterX);
             ImGui::SameLine();

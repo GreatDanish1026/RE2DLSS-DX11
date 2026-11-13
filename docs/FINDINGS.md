@@ -108,3 +108,17 @@ RE2DLSS-DX11.lua sets via.render.RenderConfig.ImageQualityRate as in the DX12 bu
 (DLAA 3840x2160), Quality 2561x1440, Balanced 2227x1252, Performance 1920x1080, back to Native,
 each applied within a fraction of a second. The game's post chain format changes with the scale
 (r11g11b10f at 67% and 58%, rgba16f at 50%); the 4K textures are recreated to match.
+
+## 0.2.0 (untested): FSR, sharpening, sharper textures
+
+- **FSR 3.1 / 4** (`src/bridge.cpp`): AMD's runtime is Direct3D 12 only. The add-on makes a D3D12
+  device on the game's adapter and shares textures (D3D12_HEAP_FLAG_SHARED, opened with
+  OpenSharedResource1) and a fence (OpenSharedFence) with D3D11. Per frame: D3D11 copies colour,
+  motion and the effect mask into the shared textures and draws the depth (r32f_x8x24 SRV) into a
+  shared r32f render target (a depth-stencil texture can't be copied into a plain one), signals,
+  flushes; D3D12 waits, runs fsr.cpp (unchanged from the D3D12 add-ons), signals; D3D11 waits on the
+  GPU and copies the output into X. Everything after is the DLSS path.
+- **Sharpening**: RCAS (rcas.hlsl, cs_5_0) after DLSS, in the clean context state; FSR's own RCAS.
+- **Sharper textures**: D3D11 samplers can't be rewritten, so after each PSSetSamplers the game's
+  material samplers (anisotropic/trilinear, wrap, with mips) are rebound as copies with
+  mip bias log2(render scale), made once per bias; follows the render scale live.
