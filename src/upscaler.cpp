@@ -43,6 +43,7 @@
 #include "blit_ps.h"  // kBlitPs, kBlitVs: blit.hlsl compiled by build.ps1
 #include "blit_vs.h"
 #include "rcas_cs.h"  // kRcasCs: rcas.hlsl
+#include "exposure_cs.h"  // kExposureCs: exposure.hlsl
 #include "bridge.hpp"
 #include "dlss.hpp"
 #include "version.h"
@@ -320,6 +321,64 @@ bool Sharpen(command_list* cl, Texture& src, Texture& dst, float sharpness) {
     return true;
 }
 
+// ---------------------------------------------------------------- the game's exposure
+//
+// The TAA multiplies the scene colour by Exposure = WhitePtSrv[0] (the game's auto-exposure,
+// when on) x exposureAdjustment before tonemapping (0.05 or so in the captures). DLSS needs that
+// value: told 1.0, it treats the colour as ~20x brighter and dims small bright lights, the more so
+// the lower the render resolution (0.2.0). exposure.hlsl computes it on the GPU into a 1x1 texture.
+
+ID3D11Texture2D* g_exposureTex = nullptr;
+ID3D11UnorderedAccessView* g_exposureUav = nullptr;
+ID3D11ComputeShader* g_exposureCs = nullptr;
+bool g_exposureFailed = false;
+
+ID3D11Resource* GameExposure(command_list* cl, const GameState& g) {
+    if (!g_set.gameExposure || g_exposureFailed) return nullptr;
+    auto* d3d = reinterpret_cast<ID3D11Device*>(cl->get_device()->get_native());
+    if (!BlitReady(d3d)) return nullptr;
+    if (!g_exposureCs) {
+        D3D11_TEXTURE2D_DESC d = {1, 1, 1, 1, DXGI_FORMAT_R32_FLOAT, {1, 0}, D3D11_USAGE_DEFAULT,
+                                  D3D11_BIND_SHADER_RESOURCE | D3D11_BIND_UNORDERED_ACCESS, 0, 0};
+        d3d->CreateTexture2D(&d, nullptr, &g_exposureTex);
+        if (g_exposureTex) d3d->CreateUnorderedAccessView(g_exposureTex, nullptr, &g_exposureUav);
+        d3d->CreateComputeShader(kExposureCs, sizeof(kExposureCs), nullptr, &g_exposureCs);
+        if (!g_exposureTex || !g_exposureUav || !g_exposureCs) {
+            g_exposureFailed = true;
+            Log("couldn't create the exposure shader: DLSS uses its own auto-exposure");
+            return nullptr;
+        }
+    }
+    const buffer_range& cb = g.psCb[1];  // the TAA's Tonemap constants
+    if (!cb.buffer.handle || !g.vsSrv0.handle) {
+        static bool logged = false;
+        if (!logged) logged = true, Log("the game's exposure inputs weren't found: DLSS uses its own auto-exposure");
+        return nullptr;
+    }
+    auto* ctx = reinterpret_cast<ID3D11DeviceContext*>(cl->get_native());
+    ID3D11DeviceContext1* ctx1 = nullptr;
+    if (FAILED(ctx->QueryInterface(__uuidof(ID3D11DeviceContext1), reinterpret_cast<void**>(&ctx1)))) return nullptr;
+    ID3DDeviceContextState* game = nullptr;
+    ctx1->SwapDeviceContextState(g_cleanState, &game);
+    ctx1->ClearState();
+    auto* buf = reinterpret_cast<ID3D11Buffer*>(cb.buffer.handle);
+    const UINT first = static_cast<UINT>(cb.offset / 16), num = 16;
+    if (cb.offset) ctx1->CSSetConstantBuffers1(0, 1, &buf, &first, &num);
+    else ctx1->CSSetConstantBuffers(0, 1, &buf);
+    auto* srv = reinterpret_cast<ID3D11ShaderResourceView*>(g.vsSrv0.handle);
+    ctx1->CSSetShaderResources(0, 1, &srv);
+    ctx1->CSSetUnorderedAccessViews(0, 1, &g_exposureUav, nullptr);
+    ctx1->CSSetShader(g_exposureCs, nullptr, 0);
+    ctx1->Dispatch(1, 1, 1);
+    ctx1->ClearState();
+    ctx1->SwapDeviceContextState(game, nullptr);
+    if (game) game->Release();
+    ctx1->Release();
+    static bool logged = false;
+    if (!logged) logged = true, Log("DLSS exposure: the game's (auto-exposure x exposureAdjustment, computed on the GPU)");
+    return g_exposureTex;
+}
+
 // ---------------------------------------------------------------- texture detail (mip bias)
 //
 // At a lower render size the GPU picks smaller mip levels, so textures look blurrier than at
@@ -502,7 +561,7 @@ bool OnTaa(command_list* cl, const GameState& g) {
         in.jitterX = jitterX, in.jitterY = jitterY;
         in.motionScaleX = 0.5f * renderW;  // NDC offsets, y up -> render pixels, y down
         in.motionScaleY = -0.5f * renderH;
-        in.exposure = ExposureOne(dev);
+        in.exposure = GameExposure(cl, g);
         in.biasMask = g_set.effectMask && mask.handle ? reinterpret_cast<ID3D11Resource*>(mask.handle) : nullptr;
         in.reset = reset;
         in.preset = g_set.preset;
@@ -766,6 +825,10 @@ void UpscalerDestroyDevice(device* dev) {
         g_biased.clear();
         g_materialSamplers.clear();
     }
+    if (g_exposureCs) g_exposureCs->Release();
+    if (g_exposureUav) g_exposureUav->Release();
+    if (g_exposureTex) g_exposureTex->Release();
+    g_exposureCs = nullptr, g_exposureUav = nullptr, g_exposureTex = nullptr;
     if (g_rcasCs) g_rcasCs->Release();
     if (g_rcasCb) g_rcasCb->Release();
     g_rcasCs = nullptr, g_rcasCb = nullptr;

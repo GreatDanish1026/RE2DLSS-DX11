@@ -23,6 +23,7 @@ struct GameState {
     uint32_t ps = 0;  // pixel shader id (FNV-1a of the bytecode)
     reshade::api::resource_view psSrv[8] = {};
     reshade::api::buffer_range psCb[4] = {};
+    reshade::api::resource_view vsSrv0 = {0};  // vertex shader t0
     reshade::api::resource_view rtv[8] = {};
     uint32_t rtvCount = 0;
     reshade::api::resource_view dsv = {0};

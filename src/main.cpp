@@ -855,6 +855,7 @@ bool GetGameState(command_list* cl, GameState* out) {
     out->ps = c.ps.shader.id;
     for (int i = 0; i < 8; ++i) out->psSrv[i] = c.ps.srv[i];
     for (int i = 0; i < 4; ++i) out->psCb[i] = c.ps.cb[i];
+    out->vsSrv0 = c.vs.srv[0];
     out->rtvCount = static_cast<uint32_t>(c.rtvs.size() < 8 ? c.rtvs.size() : 8);
     for (uint32_t i = 0; i < out->rtvCount; ++i) out->rtv[i] = c.rtvs[i];
     out->dsv = c.dsv;
