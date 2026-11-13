@@ -98,3 +98,13 @@ pixel x SceneInfo.screenInverseSize: running it and then drawing our image over 
 RenoDX on: the scene targets are rgba16f (format 10) and the tonemapped/sharpened 4K textures are
 created rgba16f to match. DLSS ran at every Image Quality step (model K, the user's choice) and
 DLAA with no errors; the redirected tonemap is the game's own draw, so RenoDX's tonemap applies.
+
+## 0.1.1 render resolution dropdown (2026-11-13, works)
+
+Needs REFramework's TDB66 build. The June 2022 release failed to start on D3D11 under ReShade
+("Failed to initialize REFramework on DirectX 11"); **nightly 01366** (`RE2_TDB66.zip`, the last
+nightly with per-game TDB builds; later nightlies are one REFramework.zip without TDB66) starts.
+RE2DLSS-DX11.lua sets via.render.RenderConfig.ImageQualityRate as in the DX12 build. Log: Native
+(DLAA 3840x2160), Quality 2561x1440, Balanced 2227x1252, Performance 1920x1080, back to Native,
+each applied within a fraction of a second. The game's post chain format changes with the scale
+(r11g11b10f at 67% and 58%, rgba16f at 50%); the 4K textures are recreated to match.
