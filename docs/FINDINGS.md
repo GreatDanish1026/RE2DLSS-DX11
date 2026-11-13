@@ -92,3 +92,9 @@ pixel x SceneInfo.screenInverseSize: running it and then drawing our image over 
   persists and the game may not set it again); the stretch draw runs, then Y/Z is drawn over its
   colour.
 - SceneInfo comes from the CPU's last write to the 512-byte constant buffer bound as b0.
+
+## 0.1.0 with RenoDX (2026-11-13)
+
+RenoDX on: the scene targets are rgba16f (format 10) and the tonemapped/sharpened 4K textures are
+created rgba16f to match. DLSS ran at every Image Quality step (model K, the user's choice) and
+DLAA with no errors; the redirected tonemap is the game's own draw, so RenoDX's tonemap applies.
