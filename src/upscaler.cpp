@@ -1031,6 +1031,12 @@ void UpscalerOverlay() {
             if (ImGui::Combo("Render resolution", &g_set.mode, modeNames, kModeCount)) {
                 changed = true;
                 WriteWantedScale();
+                // The DLSS model follows the render resolution: back to Automatic, which picks the model
+                // NVIDIA recommends for it (K down to Balanced, M at Performance).
+                if (g_set.preset != dlss::kPresetAuto) {
+                    g_set.preset = dlss::kPresetAuto;
+                    Log("render resolution changed: DLSS model back to Automatic");
+                }
             }
             Help("Sets the game's render scale (its Image Quality setting) while upscaling is on, and keeps it there. "
                  "Needs REFramework's build for this game version (TDB66, for the dx11_non-rt branch): the bundled "
@@ -1058,7 +1064,13 @@ void UpscalerOverlay() {
                 changed = true;
             }
             ImGui::EndDisabled();
-            Help("Automatic: K at higher render scales, M around 50%, L at 33% (NVIDIA's recommendation).");
+            Help("Automatic: the model NVIDIA recommends for the render resolution: K at Native, Quality and Balanced, "
+                 "M at Performance. Changing the render resolution here sets it back to Automatic; pick a model after "
+                 "that to keep it.");
+            if (g_set.preset == dlss::kPresetAuto && g_active == Tech::Dlss && g_lastRun) {
+                const float s = g_renderScale.load();
+                ImGui::TextDisabled("Automatic is using %s", s >= 0.54f ? "K" : s >= 0.42f ? "M" : "L");
+            }
             ImGui::SetNextItemWidth(ControlWidth());
             changed |= ImGui::SliderFloat("Sharpening", &g_set.sharpness, 0.0f, 1.0f, g_set.sharpness < 0.005f ? "Off" : "%.2f");
             Help("Extra sharpening of the upscaled image (AMD's RCAS, contrast-adaptive: crisper edges without halos). "

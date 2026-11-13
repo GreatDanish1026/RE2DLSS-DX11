@@ -13,7 +13,8 @@ branch `dx11_non-rt`, without ray tracing) that replaces the game's TAA with **N
 - **Upscaler**: Auto (DLSS on NVIDIA RTX cards, FSR on others), DLSS, or FSR. AMD's FSR runtime is
   Direct3D 12 only, so FSR runs on a Direct3D 12 device next to the game's, with the images shared
   between the two; on Radeon cards that support it, AMD's runtime picks FSR 4.
-- **DLSS model**: Automatic (K, M at Performance), or K, J, L or M.
+- **DLSS model**: Automatic (K at Native, Quality and Balanced, M at Performance), or K, J, L or M.
+  Changing the render resolution in the overlay sets it back to Automatic.
 - **Sharpening** slider (off by default): AMD's contrast-adaptive sharpening (RCAS) after DLSS, or
   FSR's own for FSR.
 - **Sharper textures** (on by default): when upscaling, textures are sampled as at your screen
