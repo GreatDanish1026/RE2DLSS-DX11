@@ -80,7 +80,9 @@ struct Settings {
     int preset = dlss::kPresetAuto;
     bool upscale = true;       // below 100%: DLSS to the output size (else DLAA at render size)
     bool sharpen = true;       // the game's sharpening at output size when upscaling
-    bool gameExposure = true;  // DLSS gets exposure 1.0 (the TAA's colour) instead of guessing it
+    // DLSS gets the game's exposure (exposure.hlsl) instead of its own auto-exposure. Off by
+    // default: with it, DLSS turned Leon see-through (user, 2026-11-13; the value was right, ~0.09).
+    bool gameExposure = false;
     bool effectMask = true;    // DLSS gets the TAA's effect mask (particles, effects)
     bool textureDetail = true; // material samplers get a mip bias of log2(render scale) when upscaling
     float sharpness = 0;       // extra sharpening after DLSS (RCAS), or FSR's own; 0 = off
@@ -1086,7 +1088,9 @@ void UpscalerOverlay() {
             changed |= ImGui::Checkbox("Game's sharpening at output resolution", &g_set.sharpen);
             Help("The game's own sharpening pass (its Sharpness setting), run on the upscaled image.");
             changed |= ImGui::Checkbox("Use the game's exposure", &g_set.gameExposure);
-            Help("DLSS is told the colour's exposure instead of estimating it: steadier brightness.");
+            Help("Off (default): DLSS estimates the exposure itself. On: DLSS is told the game's exposure; in testing "
+                 "this made characters' dithered fade (Leon close to the camera) look see-through. FSR always "
+                 "estimates its own.");
             changed |= ImGui::Checkbox("Use the game's effect mask", &g_set.effectMask);
             Help("The mask the game's TAA uses for particles and effects: DLSS and FSR trust the current frame more there.");
             changed |= ImGui::Checkbox("Sharper textures", &g_set.textureDetail);

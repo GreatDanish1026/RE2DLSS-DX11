@@ -51,8 +51,9 @@ ReShade overlay (Home key), Add-ons tab, **RE2DLSS-DX11**; saved in `ReShade.ini
 - **Settings**: upscaling on/off (F9), upscaler, render resolution, DLSS model, sharpening.
 - **Status**: what's running (upscaler, render size, native or upscaling), or why it isn't.
 - **Advanced**: upscaling below 100% (off: the upscaler anti-aliases at the render resolution and
-  the game stretches the result), the game's sharpening at full resolution, the game's exposure and
-  effect mask, sharper textures, and a frame capture tool for development.
+  the game stretches the result), the game's sharpening at full resolution, the game's effect mask,
+  sharper textures, the game's exposure for DLSS (off by default: it made characters' dithered fade
+  look see-through), and a frame capture tool for development.
 
 ## Notes
 

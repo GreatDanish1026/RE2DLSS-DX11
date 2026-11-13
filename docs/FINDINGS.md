@@ -144,3 +144,8 @@ each applied within a fraction of a second. The game's post chain format changes
   (downsample.hlsl, 2x2 bilinear taps per pixel) into the TAA target and the game's TAA is skipped.
 - **Leon see-through until the bias changed**: a new sampler reusing a released sampler's address
   kept the old biased copy. OnInitSampler now drops whatever was recorded for that handle.
+- **Leon see-through (actual cause)**: the game's exposure for DLSS. The logged value was right
+  (0.03125 in menus, 0.09-0.24 in game, useAutoExposure 1, exposureAdjustment 0.0544), but with it
+  DLSS turned the character's dithered fade see-through; DLSS's own auto-exposure doesn't (user).
+  GameExposure is now off by default. The sampler-reuse fix stays (a real bug, not this one).
+  Bloom with the scaled-down DLSS image as its input: "acceptable in its improvement" (user).
