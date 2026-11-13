@@ -68,7 +68,17 @@ So RE2DLSS's design applies: DLSS in place of PreTonemap2_PS writing an output-s
 bloom composite, tonemap and sharpening redirected to output size, the stretch replaced by a copy.
 psaff99b25 also writes a 4K depth (for the HUD?), to check from its bytecode (added to DumpShaders).
 
-## 0.1.0 (DLSS, untested)
+## 0.1.0 test (2026-11-13, user: "looked a lot better")
+
+RenoDX off, game HDR on, 4K. Log: NGX D3D11 started (the NVIDIA app's driver override loaded
+DLSS 310.9.16), DLSS ran at every Image Quality step from 50% to 100% with no errors: 1920x1080
+(preset M), 2304x1296, 2688x1512, 3072x1728, 3456x1944 (preset K) -> 3840x2160, and DLAA at
+3840x2160. Tonemapped and sharpened 4K textures were created in the game's format (r11g11b10f).
+
+The stretch psaff99b25 (docs/shaders) is bilinear colour (t1) + depth (t0) to SV_Depth, UV =
+pixel x SceneInfo.screenInverseSize: running it and then drawing our image over its colour is right.
+
+## 0.1.0 (DLSS)
 
 `src/upscaler.cpp`, `src/dlss.cpp`: RE2DLSS's design on D3D11.
 
