@@ -45,5 +45,10 @@ if ($Install) {
     if (-not (Test-Path "$GameDir\$exe")) { throw "$exe not found in $GameDir (pass -GameDir)" }
     if (Get-Process ([IO.Path]::GetFileNameWithoutExtension($exe)) -ErrorAction SilentlyContinue) { throw "Close the game first." }
     Copy-Item $addon, $ngx $GameDir -Force
+    # REFramework companion script: sets the render scale for the render resolution dropdown.
+    if (Test-Path "$GameDir\reframework") {
+        New-Item -ItemType Directory -Force "$GameDir\reframework\autorun" | Out-Null
+        Copy-Item "$root\reframework\$name.lua" "$GameDir\reframework\autorun" -Force
+    } else { Write-Warning "REFramework not installed: the render resolution dropdown needs it" }
     Write-Host "Installed to $GameDir"
 }

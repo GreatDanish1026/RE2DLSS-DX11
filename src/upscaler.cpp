@@ -77,7 +77,20 @@ struct Settings {
     bool gameExposure = true;  // DLSS gets exposure 1.0 (the TAA's colour) instead of guessing it
     bool effectMask = true;    // DLSS gets the TAA's effect mask (particles, effects)
     bool flipJitterX = false, flipJitterY = false;
+    int mode = 0;  // render resolution through RE2DLSS-DX11.lua (0: the game's Image Quality slider)
 } g_set;
+
+struct Mode {
+    const char* name;
+    float scale;
+};
+// No Ultra Performance (33%): in RE2's DX12 build its colours come out wrong.
+const Mode kModes[] = {{"Game's Image Quality slider", 0},
+                       {"Native (100%): DLAA", 1.0f},
+                       {"Quality (67%)", 0.667f},
+                       {"Balanced (58%)", 0.58f},
+                       {"Performance (50%)", 0.5f}};
+constexpr int kModeCount = sizeof(kModes) / sizeof(kModes[0]);
 
 struct Preset {
     const char* name;
@@ -98,6 +111,8 @@ void LoadSettings() {
     reshade::get_config_value(nullptr, RD_PRODUCT, "GameSharpening", g_set.sharpen);
     reshade::get_config_value(nullptr, RD_PRODUCT, "GameExposure", g_set.gameExposure);
     reshade::get_config_value(nullptr, RD_PRODUCT, "EffectMask", g_set.effectMask);
+    reshade::get_config_value(nullptr, RD_PRODUCT, "Mode", g_set.mode);
+    if (g_set.mode < 0 || g_set.mode >= kModeCount) g_set.mode = 0;
 }
 
 void SaveSettings() {
@@ -105,6 +120,7 @@ void SaveSettings() {
     reshade::set_config_value(nullptr, RD_PRODUCT, "DlssModel", g_set.preset);
     reshade::set_config_value(nullptr, RD_PRODUCT, "Upscale", g_set.upscale);
     reshade::set_config_value(nullptr, RD_PRODUCT, "GameSharpening", g_set.sharpen);
+    reshade::set_config_value(nullptr, RD_PRODUCT, "Mode", g_set.mode);
     reshade::set_config_value(nullptr, RD_PRODUCT, "GameExposure", g_set.gameExposure);
     reshade::set_config_value(nullptr, RD_PRODUCT, "EffectMask", g_set.effectMask);
 }
@@ -466,6 +482,53 @@ bool OnStretch(command_list* cl, const GameState& g) {
     return true;
 }
 
+// ---------------------------------------------------------------- render resolution
+//
+// The game's render scale is via.render.RenderConfig.ImageQualityRate (the Image Quality slider).
+// The REFramework script RE2DLSS-DX11.lua sets it: this side writes the wanted scale (0: leave the
+// slider alone) to reframework/data/RE2DLSS-DX11_mode.txt and reads back RE2DLSS-DX11_status.txt
+// ("<current scale> <frame>", or "error ...").
+
+std::wstring DataDir() { return ExeDir() + L"reframework\\data\\"; }
+
+float g_writtenScale = -1;
+
+void WriteWantedScale() {
+    const float want = g_set.enabled && g_set.mode > 0 ? kModes[g_set.mode].scale : 0;
+    if (want == g_writtenScale) return;
+    if (GetFileAttributesW((ExeDir() + L"reframework").c_str()) == INVALID_FILE_ATTRIBUTES) return;  // no REFramework
+    CreateDirectoryW(DataDir().c_str(), nullptr);
+    if (FILE* f = _wfopen((DataDir() + L"RE2DLSS-DX11_mode.txt").c_str(), L"w")) {
+        fprintf(f, "%.4f\n", want);
+        fclose(f);
+        g_writtenScale = want;
+        Log("render scale for RE2DLSS-DX11.lua: %s", want > 0 ? std::to_string(want).c_str() : "the game's slider");
+    }
+}
+
+// The script's last report: 1 = scale read (recent), 0 = no recent report, -1 = the script's error.
+int ScriptStatus(float* scale, std::string* error) {
+    const std::wstring path = DataDir() + L"RE2DLSS-DX11_status.txt";
+    WIN32_FILE_ATTRIBUTE_DATA a;
+    if (!GetFileAttributesExW(path.c_str(), GetFileExInfoStandard, &a)) return 0;
+    FILETIME now;
+    GetSystemTimeAsFileTime(&now);
+    const uint64_t t = (uint64_t(a.ftLastWriteTime.dwHighDateTime) << 32) | a.ftLastWriteTime.dwLowDateTime;
+    const uint64_t n = (uint64_t(now.dwHighDateTime) << 32) | now.dwLowDateTime;
+    if (n > t && n - t > 50000000ull) return 0;  // older than 5 s
+    FILE* f = _wfopen(path.c_str(), L"r");
+    if (!f) return 0;
+    char buf[256] = {};
+    fgets(buf, sizeof(buf), f);
+    fclose(f);
+    if (strncmp(buf, "error", 5) == 0) {
+        *error = buf;
+        while (!error->empty() && (error->back() == '\n' || error->back() == '\r')) error->pop_back();
+        return -1;
+    }
+    return sscanf(buf, "%f", scale) == 1 ? 1 : 0;
+}
+
 bool g_keyWasDown = false;
 const char* kVersion = RD_VERSION;
 
@@ -549,6 +612,7 @@ void UpscalerPresent(command_queue* q, swapchain* sc) {
         Log("Upscaling %s (F9)", g_set.enabled ? "on" : "off");
     }
     g_keyWasDown = down;
+    if (g_frame % 30 == 0) WriteWantedScale();  // also picks up REFramework installed after the start
     (void)q;
 }
 
@@ -558,8 +622,29 @@ void UpscalerOverlay() {
     if (ImGui::BeginTabBar("##tabs")) {
         if (ImGui::BeginTabItem("Settings")) {
             changed |= ImGui::Checkbox("Upscaling (F9)", &g_set.enabled);
-            Help("DLSS in place of the game's TAA. The render resolution is the game's Image Quality setting: 100% "
-                 "gives DLAA (native resolution), lower values are upscaled to the screen by DLSS.");
+            Help("DLSS in place of the game's TAA. 100% render resolution gives DLAA (native resolution), lower "
+                 "values are upscaled to the screen by DLSS.");
+            const char* modeNames[kModeCount];
+            for (int i = 0; i < kModeCount; ++i) modeNames[i] = kModes[i].name;
+            ImGui::SetNextItemWidth(ControlWidth());
+            if (ImGui::Combo("Render resolution", &g_set.mode, modeNames, kModeCount)) {
+                changed = true;
+                WriteWantedScale();
+            }
+            Help("Sets the game's render scale (its Image Quality setting) while upscaling is on, and keeps it there. "
+                 "Needs REFramework's build for this game version (TDB66, for the dx11_non-rt branch): the bundled "
+                 "RE2DLSS-DX11.lua sets it. \"Game's Image Quality slider\" leaves it to the game's menu.");
+            {
+                float now = 0;
+                std::string scriptError;
+                const int st = ScriptStatus(&now, &scriptError);
+                if (st > 0)
+                    ImGui::TextDisabled("Render scale now: %.0f%%%s", now * 100,
+                                        g_set.mode > 0 && g_set.enabled ? "" : " (the game's slider)");
+                else if (st < 0) ImGui::TextColored(kWarn, "RE2DLSS-DX11.lua: %s", scriptError.c_str());
+                else if (g_set.mode > 0)
+                    ImGui::TextColored(kWarn, "RE2DLSS-DX11.lua isn't running: is REFramework (TDB66 build) installed?");
+            }
             int idx = 0;
             for (int i = 0; i < kPresetCount; ++i)
                 if (kPresets[i].value == g_set.preset) idx = i;
