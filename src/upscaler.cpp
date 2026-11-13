@@ -44,6 +44,8 @@
 #include "blit_vs.h"
 #include "rcas_cs.h"  // kRcasCs: rcas.hlsl
 #include "exposure_cs.h"  // kExposureCs: exposure.hlsl
+#include "down_ps.h"      // kDownPs, kDownVs: downsample.hlsl
+#include "down_vs.h"
 #include "bridge.hpp"
 #include "dlss.hpp"
 #include "version.h"
@@ -268,6 +270,54 @@ bool Blit(command_list* cl, resource_view src, resource_view dst, uint32_t w, ui
     ctx1->RSSetViewports(1, &vp);
     ctx1->Draw(3, 0);
     ctx1->ClearState();  // nothing of ours stays bound (src may be written next)
+    ctx1->SwapDeviceContextState(game, nullptr);
+    if (game) game->Release();
+    ctx1->Release();
+    return true;
+}
+
+// The output-size image scaled down into a render-size target (downsample.hlsl).
+ID3D11VertexShader* g_downVs = nullptr;
+ID3D11PixelShader* g_downPs = nullptr;
+ID3D11SamplerState* g_linear = nullptr;
+ID3D11Buffer* g_downCb = nullptr;
+
+bool Downsample(command_list* cl, resource_view src, resource_view dst, uint32_t w, uint32_t h) {
+    auto* d3d = reinterpret_cast<ID3D11Device*>(cl->get_device()->get_native());
+    if (!BlitReady(d3d)) return false;
+    if (!g_downPs) {
+        d3d->CreateVertexShader(kDownVs, sizeof(kDownVs), nullptr, &g_downVs);
+        d3d->CreatePixelShader(kDownPs, sizeof(kDownPs), nullptr, &g_downPs);
+        D3D11_SAMPLER_DESC sd = {};
+        sd.Filter = D3D11_FILTER_MIN_MAG_MIP_LINEAR;
+        sd.AddressU = sd.AddressV = sd.AddressW = D3D11_TEXTURE_ADDRESS_CLAMP;
+        sd.MaxLOD = D3D11_FLOAT32_MAX;
+        d3d->CreateSamplerState(&sd, &g_linear);
+        D3D11_BUFFER_DESC bd = {16, D3D11_USAGE_DEFAULT, D3D11_BIND_CONSTANT_BUFFER, 0, 0, 0};
+        d3d->CreateBuffer(&bd, nullptr, &g_downCb);
+    }
+    if (!g_downVs || !g_downPs || !g_linear || !g_downCb) return false;
+    auto* ctx = reinterpret_cast<ID3D11DeviceContext*>(cl->get_native());
+    ID3D11DeviceContext1* ctx1 = nullptr;
+    if (FAILED(ctx->QueryInterface(__uuidof(ID3D11DeviceContext1), reinterpret_cast<void**>(&ctx1)))) return false;
+    ID3DDeviceContextState* game = nullptr;
+    ctx1->SwapDeviceContextState(g_cleanState, &game);
+    ctx1->ClearState();
+    const float params[4] = {1.0f / w, 1.0f / h, 0, 0};
+    ctx1->UpdateSubresource(g_downCb, 0, nullptr, params, 0, 0);
+    auto* rtv = reinterpret_cast<ID3D11RenderTargetView*>(dst.handle);
+    auto* srv = reinterpret_cast<ID3D11ShaderResourceView*>(src.handle);
+    ctx1->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+    ctx1->VSSetShader(g_downVs, nullptr, 0);
+    ctx1->PSSetShader(g_downPs, nullptr, 0);
+    ctx1->PSSetShaderResources(0, 1, &srv);
+    ctx1->PSSetSamplers(0, 1, &g_linear);
+    ctx1->PSSetConstantBuffers(0, 1, &g_downCb);
+    ctx1->OMSetRenderTargets(1, &rtv, nullptr);
+    const D3D11_VIEWPORT vp = {0, 0, static_cast<float>(w), static_cast<float>(h), 0, 1};
+    ctx1->RSSetViewports(1, &vp);
+    ctx1->Draw(3, 0);
+    ctx1->ClearState();
     ctx1->SwapDeviceContextState(game, nullptr);
     if (game) game->Release();
     ctx1->Release();
@@ -601,11 +651,18 @@ bool OnTaa(command_list* cl, const GameState& g) {
 
     bool skip;
     if (upscale) {
-        // The game's TAA still runs at render size (bloom input, history); the passes after it use X.
+        // The render-size passes after the TAA (the bloom's bright pass and blur) read the TAA
+        // target: it gets the upscaled image scaled down, and the game's TAA is skipped. (Leaving
+        // the game's TAA running for them, as RE2DLSS does, made the bloom fade toward Performance:
+        // the game's TAA keeps less of small bright lights than DLSS.) The passes after use X.
+        if (!Downsample(cl, g_x.srv, g.rtv[0], renderW, renderH)) {
+            Fail("couldn't scale the upscaled image down for the bloom");
+            return false;
+        }
         g_up = Up();
         g_up.active = true;
         g_up.taaOut = target;
-        skip = false;
+        skip = true;
     } else {
         // DLAA: DLSS's output goes into the TAA target and the game's TAA is skipped.
         if (!Blit(cl, g_x.srv, g.rtv[0], outW, outH)) {
@@ -825,6 +882,9 @@ void UpscalerDestroyDevice(device* dev) {
         g_biased.clear();
         g_materialSamplers.clear();
     }
+    for (IUnknown* o : std::initializer_list<IUnknown*>{g_downVs, g_downPs, g_linear, g_downCb})
+        if (o) o->Release();
+    g_downVs = nullptr, g_downPs = nullptr, g_linear = nullptr, g_downCb = nullptr;
     if (g_exposureCs) g_exposureCs->Release();
     if (g_exposureUav) g_exposureUav->Release();
     if (g_exposureTex) g_exposureTex->Release();
