@@ -33,6 +33,7 @@
 #include <unordered_set>
 #include <vector>
 
+#include "common.hpp"
 #include "version.h"
 
 extern "C" __declspec(dllexport) const char* NAME = RD_PRODUCT;
@@ -325,10 +326,17 @@ std::unordered_map<uint64_t, ViewInfo> g_views;
 std::unordered_map<uint64_t, std::vector<uint8_t>> g_cbData;
 std::unordered_map<uint64_t, void*> g_mapped;
 
+// SceneInfo (512 bytes) always; other constant buffers only while shaders are in the dump list.
+bool TrackCb(const resource_desc& desc) {
+    if (desc.type != resource_type::buffer || (desc.usage & resource_usage::constant_buffer) == 0) return false;
+    if (desc.buffer.size == 512) return true;
+    return desc.buffer.size <= 4096 && !(g_dumpPs.empty() && g_dumpCs.empty());
+}
+
 void OnInitResource(device*, const resource_desc& desc, const subresource_data* initial, resource_usage, resource r) {
     std::lock_guard<std::mutex> lock(g_resMutex);
     g_resources[r.handle] = desc;
-    if (desc.type == resource_type::buffer && (desc.usage & resource_usage::constant_buffer) != 0 && desc.buffer.size <= 4096) {
+    if (TrackCb(desc)) {
         std::vector<uint8_t>& v = g_cbData[r.handle];
         v.assign(static_cast<size_t>(desc.buffer.size), 0);
         if (initial && initial->data) memcpy(v.data(), initial->data, v.size());
@@ -427,13 +435,15 @@ std::string DescribeView(device* dev, resource_view v) {
 
 struct Stage {
     ShaderInfo shader;
-    std::map<uint32_t, resource_view> srv, uav;
-    std::map<uint32_t, buffer_range> cb;
+    resource_view srv[rd::kSrvSlots] = {};
+    resource_view uav[rd::kUavSlots] = {};
+    buffer_range cb[rd::kCbSlots] = {};
 };
 
 struct Context {
     Stage vs, ps, cs;
     viewport vp = {};
+    rect scissor = {};
     std::vector<resource_view> rtvs;
     resource_view dsv = {0};
     // capture
@@ -490,14 +500,16 @@ void OnPushDescriptors(command_list* cl, shader_stage stages, pipeline_layout, u
     for (uint32_t i = 0; i < u.count; ++i) {
         const uint32_t slot = u.binding + i;
         switch (u.type) {
-            case descriptor_type::constant_buffer: st->cb[slot] = static_cast<const buffer_range*>(u.descriptors)[i]; break;
+            case descriptor_type::constant_buffer:
+                if (slot < rd::kCbSlots) st->cb[slot] = static_cast<const buffer_range*>(u.descriptors)[i];
+                break;
             case descriptor_type::shader_resource_view:  // = texture_shader_resource_view
             case descriptor_type::buffer_shader_resource_view:
-                st->srv[slot] = static_cast<const resource_view*>(u.descriptors)[i];
+                if (slot < rd::kSrvSlots) st->srv[slot] = static_cast<const resource_view*>(u.descriptors)[i];
                 break;
             case descriptor_type::unordered_access_view:  // = texture_unordered_access_view
             case descriptor_type::buffer_unordered_access_view:
-                st->uav[slot] = static_cast<const resource_view*>(u.descriptors)[i];
+                if (slot < rd::kUavSlots) st->uav[slot] = static_cast<const resource_view*>(u.descriptors)[i];
                 break;
             default: break;
         }
@@ -508,6 +520,12 @@ void OnBindViewports(command_list* cl, uint32_t first, uint32_t count, const vie
     if (first != 0 || !count) return;
     std::lock_guard<std::mutex> lock(g_ctxMutex);
     Ctx(cl).vp = vps[0];
+}
+
+void OnBindScissors(command_list* cl, uint32_t first, uint32_t count, const rect* rects) {
+    if (first != 0 || !count) return;
+    std::lock_guard<std::mutex> lock(g_ctxMutex);
+    Ctx(cl).scissor = rects[0];
 }
 
 // ---------------------------------------------------------------- capture
@@ -589,11 +607,14 @@ void WriteStage(device* dev, Context& c, const Stage& st, bool dump) {
         return false;
     };
     if (!known) AddLocked(c, "    (shader declarations unknown: first 16 slots shown)");
-    for (const auto& [slot, v] : st.srv)
-        if (v.handle && declared('t', slot)) AddLocked(c, Format("    t%u = %s", slot, DescribeView(dev, v).c_str()));
-    for (const auto& [slot, v] : st.uav)
-        if (v.handle && declared('u', slot)) AddLocked(c, Format("    u%u = %s", slot, DescribeView(dev, v).c_str()));
-    for (const auto& [slot, b] : st.cb) {
+    for (uint32_t slot = 0; slot < rd::kSrvSlots; ++slot)
+        if (st.srv[slot].handle && declared('t', slot))
+            AddLocked(c, Format("    t%u = %s", slot, DescribeView(dev, st.srv[slot]).c_str()));
+    for (uint32_t slot = 0; slot < rd::kUavSlots; ++slot)
+        if (st.uav[slot].handle && declared('u', slot))
+            AddLocked(c, Format("    u%u = %s", slot, DescribeView(dev, st.uav[slot]).c_str()));
+    for (uint32_t slot = 0; slot < rd::kCbSlots; ++slot) {
+        const buffer_range& b = st.cb[slot];
         if (!b.buffer.handle || !declared('b', slot)) continue;
         AddLocked(c, Format("    b%u = cb %s +%llu", slot, Describe(dev, b.buffer).c_str(), b.offset));
         if (dump) DumpCb(c, slot, b);
@@ -616,13 +637,10 @@ void Pass(command_list* cl, bool compute, const std::string& head) {
     AddLocked(c, Format("FULLSCREEN ps%08x vs%08x ", c.ps.shader.id, c.vs.shader.id) + head +
                      Format(" viewport %gx%g at %g,%g ->%s", c.vp.width, c.vp.height, c.vp.x, c.vp.y, rts.c_str()));
     WriteStage(dev, c, c.ps, g_dumpPs.count(c.ps.shader.id) != 0);
-    if (!c.ps.uav.empty()) {
-        for (const auto& [slot, v] : c.ps.uav)
-            if (v.handle) AddLocked(c, Format("    ps u%u = %s", slot, DescribeView(dev, v).c_str()));
-    }
 }
 
 bool OnDispatch(command_list* cl, uint32_t x, uint32_t y, uint32_t z) {
+    rd::UpscalerBeforeWork(cl);
     if (Recording()) Pass(cl, true, Format("%u x %u x %u", x, y, z));
     return false;
 }
@@ -633,13 +651,15 @@ void Other(command_list* cl) {
 }
 
 bool OnDraw(command_list* cl, uint32_t vertices, uint32_t instances, uint32_t, uint32_t) {
-    if (!Recording()) return false;
-    if (vertices <= 4 && instances == 1) Pass(cl, false, Format("draw %u verts", vertices));
+    const bool skipped = rd::UpscalerOnDraw(cl, vertices, instances);
+    if (!Recording()) return skipped;
+    if (vertices <= 4 && instances == 1) Pass(cl, false, Format("draw %u verts%s", vertices, skipped ? " (replaced)" : ""));
     else Other(cl);
-    return false;
+    return skipped;
 }
 
 bool OnDrawIndexed(command_list* cl, uint32_t indices, uint32_t instances, uint32_t, int32_t, uint32_t) {
+    rd::UpscalerBeforeWork(cl);
     if (!Recording()) return false;
     if (indices <= 6 && instances == 1) Pass(cl, false, Format("draw %u indices", indices));
     else Other(cl);
@@ -647,6 +667,7 @@ bool OnDrawIndexed(command_list* cl, uint32_t indices, uint32_t instances, uint3
 }
 
 bool OnIndirect(command_list* cl, indirect_command type, resource, uint64_t, uint32_t count, uint32_t) {
+    rd::UpscalerBeforeWork(cl);
     if (!Recording()) return false;
     if (type == indirect_command::dispatch) Pass(cl, true, Format("indirect x%u", count));
     else Other(cl);
@@ -659,12 +680,14 @@ void Note(command_list* cl, std::string s) {
 }
 
 bool OnCopyResource(command_list* cl, resource src, resource dst) {
+    rd::UpscalerBeforeWork(cl);
     if (Recording()) Note(cl, Format("copy %s -> %s", Describe(cl->get_device(), src).c_str(), Describe(cl->get_device(), dst).c_str()));
     return false;
 }
 
 bool OnCopyTexture(command_list* cl, resource src, uint32_t, const subresource_box*, resource dst, uint32_t,
                    const subresource_box*, filter_mode) {
+    rd::UpscalerBeforeWork(cl);
     if (Recording())
         Note(cl, Format("copy region %s -> %s", Describe(cl->get_device(), src).c_str(), Describe(cl->get_device(), dst).c_str()));
     return false;
@@ -672,12 +695,14 @@ bool OnCopyTexture(command_list* cl, resource src, uint32_t, const subresource_b
 
 bool OnResolve(command_list* cl, resource src, uint32_t, const subresource_box*, resource dst, uint32_t, uint32_t,
                uint32_t, uint32_t, format) {
+    rd::UpscalerBeforeWork(cl);
     if (Recording())
         Note(cl, Format("resolve %s -> %s", Describe(cl->get_device(), src).c_str(), Describe(cl->get_device(), dst).c_str()));
     return false;
 }
 
 bool OnClearRtv(command_list* cl, resource_view rtv, const float color[4], uint32_t, const rect*) {
+    rd::UpscalerBeforeWork(cl);
     if (Recording())
         Note(cl, Format("clear %s to %g %g %g %g", DescribeView(cl->get_device(), rtv).c_str(), color[0], color[1], color[2], color[3]));
     return false;
@@ -758,6 +783,7 @@ std::atomic<uint64_t> g_presents{0};
 
 void OnPresent(command_queue* q, swapchain* sc, const rect*, const rect*, uint32_t, const rect*) {
     ++g_presents;
+    rd::UpscalerPresent(q, sc);
     if (!g_immediate) {
         g_immediate = q->get_native();
         const resource_desc d = sc->get_device()->get_resource_desc(sc->get_current_back_buffer());
@@ -799,27 +825,83 @@ void OnPresent(command_queue* q, swapchain* sc, const rect*, const rect*, uint32
 
 // ---------------------------------------------------------------- overlay
 
-void DrawOverlay(effect_runtime*) {
-    ImGui::TextUnformatted(RD_PRODUCT " " RD_VERSION ": probe build (no upscaling yet)");
+void DrawOverlay(effect_runtime*) { rd::UpscalerOverlay(); }
+
+void OnDestroyDevice(device* dev) { rd::UpscalerDestroyDevice(dev); }
+
+}  // namespace
+
+namespace rd {
+
+void Log(const char* fmt, ...) {
+    va_list ap;
+    va_start(ap, fmt);
+    LogV(fmt, ap);
+    va_end(ap);
+}
+
+std::wstring ExeDir() { return g_exeDir; }
+
+bool GetGameState(command_list* cl, GameState* out) {
+    std::lock_guard<std::mutex> lock(g_ctxMutex);
+    auto it = g_contexts.find(cl->get_native());
+    if (it == g_contexts.end()) return false;
+    const Context& c = it->second;
+    *out = GameState();
+    out->ps = c.ps.shader.id;
+    for (int i = 0; i < 8; ++i) out->psSrv[i] = c.ps.srv[i];
+    for (int i = 0; i < 4; ++i) out->psCb[i] = c.ps.cb[i];
+    out->rtvCount = static_cast<uint32_t>(c.rtvs.size() < 8 ? c.rtvs.size() : 8);
+    for (uint32_t i = 0; i < out->rtvCount; ++i) out->rtv[i] = c.rtvs[i];
+    out->dsv = c.dsv;
+    out->vp = c.vp;
+    out->scissor = c.scissor;
+    return true;
+}
+
+void RestoreGameState(command_list* cl) {
+    GameState g;
+    if (!GetGameState(cl, &g)) return;
+    cl->bind_render_targets_and_depth_stencil(g.rtvCount, g.rtv, g.dsv);
+    cl->bind_viewports(0, 1, &g.vp);
+    cl->bind_scissor_rects(0, 1, &g.scissor);
+    descriptor_table_update u = {};
+    u.count = 8;
+    u.type = descriptor_type::shader_resource_view;
+    u.descriptors = g.psSrv;
+    cl->push_descriptors(shader_stage::pixel, pipeline_layout{0}, 0, u);
+    u.count = 4;
+    u.type = descriptor_type::constant_buffer;
+    u.descriptors = g.psCb;
+    cl->push_descriptors(shader_stage::pixel, pipeline_layout{0}, 0, u);
+}
+
+resource ViewResource(resource_view view) {
+    ViewInfo info;
+    return FindView(view, &info) ? info.res : resource{0};
+}
+
+bool ReadCb(resource buffer, uint64_t offset, void* out, size_t size) {
+    std::lock_guard<std::mutex> lock(g_resMutex);
+    auto it = g_cbData.find(buffer.handle);
+    if (it == g_cbData.end() || offset + size > it->second.size()) return false;
+    memcpy(out, it->second.data() + offset, size);
+    return true;
+}
+
+void DrawCaptureTool() {
     ImGui::BeginDisabled(g_capture.load() != Capture::Idle);
     if (ImGui::Button(g_captureHotkey ? "Capture frame (F10)" : "Capture frame")) StartCapture();
     ImGui::EndDisabled();
+    Help("Writes two frames of the game's GPU work to " RD_PRODUCT "-frame-N.txt next to re2.exe, for finding the "
+         "game's passes.");
     ImGui::SameLine();
     ImGui::TextDisabled("%s", g_capture.load() == Capture::Recording ? "recording..." : g_status.c_str());
-    {
-        std::lock_guard<std::mutex> lock(g_pipeMutex);
-        ImGui::TextDisabled("shaders: %zu vertex, %zu pixel, %zu compute", g_counts[0], g_counts[1], g_counts[2]);
-    }
-    size_t contexts;
-    {
-        std::lock_guard<std::mutex> lock(g_ctxMutex);
-        contexts = g_contexts.size();
-    }
-    ImGui::TextDisabled("device contexts: %zu; deferred command lists finished %llu, executed %llu", contexts,
-                        static_cast<unsigned long long>(g_deferredSeen.load()), static_cast<unsigned long long>(g_executes.load()));
+    std::lock_guard<std::mutex> lock(g_pipeMutex);
+    ImGui::TextDisabled("shaders: %zu vertex, %zu pixel, %zu compute", g_counts[0], g_counts[1], g_counts[2]);
 }
 
-}  // namespace
+}  // namespace rd
 
 BOOL APIENTRY DllMain(HMODULE module, DWORD reason, LPVOID) {
     switch (reason) {
@@ -847,6 +929,8 @@ BOOL APIENTRY DllMain(HMODULE module, DWORD reason, LPVOID) {
             reshade::register_event<reshade::addon_event::bind_pipeline>(&OnBindPipeline);
             reshade::register_event<reshade::addon_event::push_descriptors>(&OnPushDescriptors);
             reshade::register_event<reshade::addon_event::bind_viewports>(&OnBindViewports);
+            reshade::register_event<reshade::addon_event::bind_scissor_rects>(&OnBindScissors);
+            reshade::register_event<reshade::addon_event::destroy_device>(&OnDestroyDevice);
             reshade::register_event<reshade::addon_event::bind_render_targets_and_depth_stencil>(&OnBindRenderTargets);
             reshade::register_event<reshade::addon_event::dispatch>(&OnDispatch);
             reshade::register_event<reshade::addon_event::draw>(&OnDraw);
@@ -858,8 +942,10 @@ BOOL APIENTRY DllMain(HMODULE module, DWORD reason, LPVOID) {
             reshade::register_event<reshade::addon_event::clear_render_target_view>(&OnClearRtv);
             reshade::register_event<reshade::addon_event::present>(&OnPresent);
             reshade::register_overlay(RD_PRODUCT, &DrawOverlay);
+            rd::UpscalerInit();
             break;
         case DLL_PROCESS_DETACH:
+            rd::UpscalerShutdown();
             if (g_veh) RemoveVectoredExceptionHandler(g_veh);
             reshade::unregister_addon(module);
             if (g_log) fclose(g_log);

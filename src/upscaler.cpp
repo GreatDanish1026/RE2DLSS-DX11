@@ -1,0 +1,613 @@
+// DLSS in place of Resident Evil 2's TAA, DirectX 11 build (docs/FINDINGS.md). The design is
+// RE2DLSS's (the DirectX 12 build has the same post chain):
+//
+// The TAA pass (PreTonemap2_PS, psddfad309) is a full-screen draw reading the effect mask (t0),
+// depth (t1, reverse-Z), the scene colour (t2), last frame's TAA output (t3) and the velocity (t4:
+// NDC offset to the previous position, y up), with the camera constants (SceneInfo) in b0. DLSS
+// takes the same inputs: motion vectors scaled by (0.5 w, -0.5 h), jitter SceneInfo.projElement[0].zw
+// (clip space) times half the render size.
+//
+// DLAA (render size = output size, Image Quality 100% or more): the TAA draw is skipped and DLSS's
+// output is drawn into the TAA target. Everything after it runs as the game does.
+//
+// Upscaling (render size below the output size): everything after TAA runs at render size, then a
+// full-screen pass (psaff99b25) stretches the image (and the depth) to the output size. So:
+//   1. TAA: DLSS writes an output-size image X; the game's TAA still runs (bloom input, history).
+//   2. Bloom composite (ps629a5b35, additive): the game's draw goes into X.
+//   3. Tonemap (ps81003188, reads t0 by pixel position and SceneInfo's screen size): the game's
+//      draw goes into Y at output size, with t0 = X and a SceneInfo copy with the output size.
+//   4. The game's sharpening (psff2662f2): the same, from Y into Z (optional).
+//   5. The stretch: the game's draw runs (it writes the output-size depth), then Y or Z is drawn
+//      over its colour.
+// Steps 2-4 change the game's bindings and let the game's own draw run (so RenoDX's per-draw work
+// still applies, as in RE2DLSS 0.1.1); the game's bindings are put back before its next GPU call.
+//
+// D3D11 keeps one pipeline state per device context, so DLSS (and the add-on's own copies) run in
+// a separate, clean state (ID3DDeviceContextState) that is swapped in and out.
+
+#define WIN32_LEAN_AND_MEAN
+#include <windows.h>
+
+#include <d3d11_1.h>
+
+#include "common.hpp"
+
+#include <atomic>
+#include <cmath>
+#include <cstdio>
+#include <cstring>
+#include <map>
+#include <mutex>
+#include <string>
+
+#include "blit_ps.h"  // kBlitPs, kBlitVs: blit.hlsl compiled by build.ps1
+#include "blit_vs.h"
+#include "dlss.hpp"
+#include "version.h"
+
+using namespace reshade::api;
+
+namespace rd {
+namespace {
+
+// Resident Evil 2 DirectX 11 shaders (docs/FINDINGS.md).
+constexpr uint32_t kTaaPs = 0xddfad309;      // PreTonemap2_PS
+constexpr uint32_t kTaaMask = 0, kTaaDepth = 1, kTaaColor = 2, kTaaMotion = 4;
+constexpr uint32_t kBloomPs = 0x629a5b35;    // bloom composite (additive into the TAA output)
+constexpr uint32_t kTonemapPs = 0x81003188;  // tonemap (t0 by pixel position)
+constexpr uint32_t kSharpenPs = 0xff2662f2;  // the game's sharpening (t0)
+constexpr uint32_t kStretchPs = 0xaff99b25;  // render size -> output size (t0 depth, t1 colour)
+constexpr uint32_t kStretchColor = 1;
+constexpr int kToggleHotkey = VK_F9;
+
+// SceneInfo (cb0 of the TAA, tonemap and sharpening), as float indices.
+constexpr int kViewProj = 0;            // row_major float4x4, byte 0
+constexpr int kProjElement0 = 40;       // byte 160: x scale, y scale, jitter x, jitter y (clip space)
+constexpr int kPrevViewProj = 72;       // byte 288
+constexpr int kScreenSize = 92;         // byte 368: width, height, 1 / width, 1 / height
+constexpr int kSceneInfoFloats = 128;   // 512 bytes
+
+// ---------------------------------------------------------------- settings
+
+struct Settings {
+    bool enabled = true;  // F9
+    int preset = dlss::kPresetAuto;
+    bool upscale = true;       // below 100%: DLSS to the output size (else DLAA at render size)
+    bool sharpen = true;       // the game's sharpening at output size when upscaling
+    bool gameExposure = true;  // DLSS gets exposure 1.0 (the TAA's colour) instead of guessing it
+    bool effectMask = true;    // DLSS gets the TAA's effect mask (particles, effects)
+    bool flipJitterX = false, flipJitterY = false;
+} g_set;
+
+struct Preset {
+    const char* name;
+    int value;
+};
+const Preset kPresets[] = {{"Automatic (K, M at 50%, L at 33%)", dlss::kPresetAuto},
+                           {"K (DLSS 4 transformer)", 11},
+                           {"J", 10},
+                           {"L (DLSS 4.5)", 12},
+                           {"M (DLSS 4.5)", 13},
+                           {"NVIDIA's default", 0}};
+constexpr int kPresetCount = sizeof(kPresets) / sizeof(kPresets[0]);
+
+void LoadSettings() {
+    reshade::get_config_value(nullptr, RD_PRODUCT, "Enabled", g_set.enabled);
+    reshade::get_config_value(nullptr, RD_PRODUCT, "DlssModel", g_set.preset);
+    reshade::get_config_value(nullptr, RD_PRODUCT, "Upscale", g_set.upscale);
+    reshade::get_config_value(nullptr, RD_PRODUCT, "GameSharpening", g_set.sharpen);
+    reshade::get_config_value(nullptr, RD_PRODUCT, "GameExposure", g_set.gameExposure);
+    reshade::get_config_value(nullptr, RD_PRODUCT, "EffectMask", g_set.effectMask);
+}
+
+void SaveSettings() {
+    reshade::set_config_value(nullptr, RD_PRODUCT, "Enabled", g_set.enabled);
+    reshade::set_config_value(nullptr, RD_PRODUCT, "DlssModel", g_set.preset);
+    reshade::set_config_value(nullptr, RD_PRODUCT, "Upscale", g_set.upscale);
+    reshade::set_config_value(nullptr, RD_PRODUCT, "GameSharpening", g_set.sharpen);
+    reshade::set_config_value(nullptr, RD_PRODUCT, "GameExposure", g_set.gameExposure);
+    reshade::set_config_value(nullptr, RD_PRODUCT, "EffectMask", g_set.effectMask);
+}
+
+// ---------------------------------------------------------------- status
+
+std::mutex g_statusMutex;
+std::string g_lastError, g_mode;
+uint64_t g_frame = 0, g_lastRun = 0, g_runs = 0;
+
+void Fail(const std::string& why) {
+    std::lock_guard<std::mutex> lock(g_statusMutex);
+    if (why != g_lastError) Log("not upscaling: %s", why.c_str());
+    g_lastError = why;
+}
+
+// ---------------------------------------------------------------- our resources
+
+device* g_dev = nullptr;
+uint32_t g_outW = 0, g_outH = 0;  // the swap chain's size
+
+struct Texture {
+    resource res = {0};
+    resource_view srv = {0}, rtv = {0}, uav = {0};
+    uint32_t w = 0, h = 0;
+    format fmt = format::unknown;
+};
+Texture g_x;  // DLSS output (rgba16f, UAV; render target for the bloom, shader resource for the tonemap)
+Texture g_y;  // tonemapped output-size image
+Texture g_z;  // sharpened output-size image
+
+void Free(Texture& t) {
+    if (!g_dev) return;
+    if (t.srv.handle) g_dev->destroy_resource_view(t.srv);
+    if (t.rtv.handle) g_dev->destroy_resource_view(t.rtv);
+    if (t.uav.handle) g_dev->destroy_resource_view(t.uav);
+    if (t.res.handle) g_dev->destroy_resource(t.res);
+    t = Texture();
+}
+
+bool Ensure(device* dev, Texture& t, uint32_t w, uint32_t h, format fmt, bool uav, const char* name) {
+    if (t.res.handle && t.w == w && t.h == h && t.fmt == fmt) return true;
+    Free(t);
+    resource_usage usage = resource_usage::shader_resource | resource_usage::render_target;
+    if (uav) usage |= resource_usage::unordered_access;
+    const resource_desc d(w, h, 1, 1, fmt, 1, memory_heap::default_, usage);
+    if (!dev->create_resource(d, nullptr, resource_usage::shader_resource, &t.res)) {
+        Log("couldn't create the %ux%u %s texture (format %u)", w, h, name, static_cast<unsigned>(fmt));
+        t = Texture();
+        return false;
+    }
+    dev->create_resource_view(t.res, resource_usage::shader_resource, resource_view_desc(fmt), &t.srv);
+    dev->create_resource_view(t.res, resource_usage::render_target, resource_view_desc(fmt), &t.rtv);
+    if (uav) dev->create_resource_view(t.res, resource_usage::unordered_access, resource_view_desc(fmt), &t.uav);
+    if (!t.srv.handle || !t.rtv.handle || (uav && !t.uav.handle)) {
+        Log("couldn't create views of the %s texture", name);
+        Free(t);
+        return false;
+    }
+    t.w = w, t.h = h, t.fmt = fmt;
+    Log("created the %ux%u %s texture (format %u)", w, h, name, static_cast<unsigned>(fmt));
+    return true;
+}
+
+resource g_exposureOne = {0};  // 1x1 r32f = 1.0
+resource g_sceneCb = {0};      // SceneInfo copy with the output size
+
+ID3D11Resource* ExposureOne(device* dev) {
+    if (!g_set.gameExposure) return nullptr;
+    if (!g_exposureOne.handle) {
+        float one = 1.0f;
+        subresource_data data = {&one, 4, 4};
+        if (!dev->create_resource(resource_desc(1, 1, 1, 1, format::r32_float, 1, memory_heap::default_,
+                                                resource_usage::shader_resource),
+                                  &data, resource_usage::shader_resource, &g_exposureOne)) {
+            g_exposureOne = {0};
+            return nullptr;
+        }
+    }
+    return reinterpret_cast<ID3D11Resource*>(g_exposureOne.handle);
+}
+
+// ---------------------------------------------------------------- the add-on's own draws
+//
+// Copies (with format conversion) run in a clean pipeline state of their own, so none of the
+// game's bindings change.
+
+ID3DDeviceContextState* g_cleanState = nullptr;
+ID3D11VertexShader* g_blitVs = nullptr;
+ID3D11PixelShader* g_blitPs = nullptr;
+bool g_blitFailed = false;
+
+bool BlitReady(ID3D11Device* d3d) {
+    if (g_blitVs && g_blitPs && g_cleanState) return true;
+    if (g_blitFailed) return false;
+    ID3D11Device1* dev1 = nullptr;
+    if (SUCCEEDED(d3d->QueryInterface(__uuidof(ID3D11Device1), reinterpret_cast<void**>(&dev1)))) {
+        const D3D_FEATURE_LEVEL level = d3d->GetFeatureLevel();
+        dev1->CreateDeviceContextState(0, &level, 1, D3D11_SDK_VERSION, __uuidof(ID3D11Device), nullptr, &g_cleanState);
+        dev1->Release();
+    }
+    d3d->CreateVertexShader(kBlitVs, sizeof(kBlitVs), nullptr, &g_blitVs);
+    d3d->CreatePixelShader(kBlitPs, sizeof(kBlitPs), nullptr, &g_blitPs);
+    if (!g_cleanState || !g_blitVs || !g_blitPs) {
+        g_blitFailed = true;
+        Log("couldn't create the copy shaders (Direct3D 11.1 needed)");
+        return false;
+    }
+    return true;
+}
+
+// src (shader resource view) -> dst (render target view), both w x h.
+bool Blit(command_list* cl, resource_view src, resource_view dst, uint32_t w, uint32_t h) {
+    auto* d3d = reinterpret_cast<ID3D11Device*>(cl->get_device()->get_native());
+    if (!BlitReady(d3d)) return false;
+    auto* ctx = reinterpret_cast<ID3D11DeviceContext*>(cl->get_native());
+    ID3D11DeviceContext1* ctx1 = nullptr;
+    if (FAILED(ctx->QueryInterface(__uuidof(ID3D11DeviceContext1), reinterpret_cast<void**>(&ctx1)))) return false;
+    ID3DDeviceContextState* game = nullptr;
+    ctx1->SwapDeviceContextState(g_cleanState, &game);
+    ctx1->ClearState();
+    auto* rtv = reinterpret_cast<ID3D11RenderTargetView*>(dst.handle);
+    auto* srv = reinterpret_cast<ID3D11ShaderResourceView*>(src.handle);
+    ctx1->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+    ctx1->VSSetShader(g_blitVs, nullptr, 0);
+    ctx1->PSSetShader(g_blitPs, nullptr, 0);
+    ctx1->PSSetShaderResources(0, 1, &srv);
+    ctx1->OMSetRenderTargets(1, &rtv, nullptr);
+    const D3D11_VIEWPORT vp = {0, 0, static_cast<float>(w), static_cast<float>(h), 0, 1};
+    ctx1->RSSetViewports(1, &vp);
+    ctx1->Draw(3, 0);
+    ctx1->ClearState();  // nothing of ours stays bound (src may be written next)
+    ctx1->SwapDeviceContextState(game, nullptr);
+    if (game) game->Release();
+    ctx1->Release();
+    return true;
+}
+
+// ---------------------------------------------------------------- upscaling state
+
+struct Up {
+    bool active = false;  // upscaling this frame: the passes after TAA go to output size
+    bool bloomDone = false, tonemapDone = false, sharpenDone = false;
+    resource taaOut = {0}, tonemapOut = {0}, sharpenOut = {0};  // the game's render-size targets
+    Texture* final = nullptr;
+} g_up;
+bool g_restorePending = false;  // the game's bindings were changed for its draw: put back next
+
+std::atomic<float> g_renderScale{1};
+
+bool CameraCut(const float* scene) {
+    float diff = 0;
+    for (int r = 0; r < 3; ++r)
+        for (int c = 0; c < 3; ++c)
+            diff = std::fmax(diff, std::fabs(scene[kViewProj + r * 4 + c] - scene[kPrevViewProj + r * 4 + c]));
+    return diff > 1.0f || !std::isfinite(diff);
+}
+
+float JitterX(const float* scene, uint32_t w) { return -scene[kProjElement0 + 2] * w * 0.5f * (g_set.flipJitterX ? -1 : 1); }
+float JitterY(const float* scene, uint32_t h) { return scene[kProjElement0 + 3] * h * 0.5f * (g_set.flipJitterY ? -1 : 1); }
+
+// Binds a render target (no depth), viewport and scissor of w x h.
+void BindTarget(command_list* cl, resource_view rtv, uint32_t w, uint32_t h) {
+    cl->bind_render_targets_and_depth_stencil(1, &rtv, resource_view{0});
+    const viewport vp = {0, 0, static_cast<float>(w), static_cast<float>(h), 0, 1};
+    cl->bind_viewports(0, 1, &vp);
+    const rect sc = {0, 0, static_cast<int32_t>(w), static_cast<int32_t>(h)};
+    cl->bind_scissor_rects(0, 1, &sc);
+}
+
+void BindPsSrv(command_list* cl, uint32_t slot, resource_view v) {
+    descriptor_table_update u = {};
+    u.binding = slot;
+    u.count = 1;
+    u.type = descriptor_type::shader_resource_view;
+    u.descriptors = &v;
+    cl->push_descriptors(shader_stage::pixel, pipeline_layout{0}, 0, u);
+}
+
+// SceneInfo with the output size, bound as the pixel shader's b0.
+bool BindSceneInfoAtOutputSize(command_list* cl, const GameState& g, uint32_t w, uint32_t h) {
+    float scene[kSceneInfoFloats];
+    if (!ReadCb(g.psCb[0].buffer, g.psCb[0].offset, scene, sizeof(scene))) return false;
+    device* dev = cl->get_device();
+    if (!g_sceneCb.handle &&
+        !dev->create_resource(resource_desc(sizeof(scene), memory_heap::default_, resource_usage::constant_buffer), nullptr,
+                              resource_usage::constant_buffer, &g_sceneCb)) {
+        g_sceneCb = {0};
+        return false;
+    }
+    scene[kScreenSize] = static_cast<float>(w);
+    scene[kScreenSize + 1] = static_cast<float>(h);
+    scene[kScreenSize + 2] = 1.0f / w;
+    scene[kScreenSize + 3] = 1.0f / h;
+    cl->update_buffer_region(scene, g_sceneCb, 0, sizeof(scene));
+    const buffer_range cb = {g_sceneCb, 0, sizeof(scene)};
+    descriptor_table_update u = {};
+    u.count = 1;
+    u.type = descriptor_type::constant_buffer;
+    u.descriptors = &cb;
+    cl->push_descriptors(shader_stage::pixel, pipeline_layout{0}, 0, u);
+    return true;
+}
+
+// ---------------------------------------------------------------- passes
+
+bool OnTaa(command_list* cl, const GameState& g) {
+    device* dev = cl->get_device();
+    const resource depth = ViewResource(g.psSrv[kTaaDepth]);
+    const resource color = ViewResource(g.psSrv[kTaaColor]);
+    const resource motion = ViewResource(g.psSrv[kTaaMotion]);
+    const resource mask = ViewResource(g.psSrv[kTaaMask]);
+    const resource target = ViewResource(g.rtv[0]);
+    if (!depth.handle || !color.handle || !motion.handle || !target.handle || !g.rtv[0].handle) {
+        Fail("TAA inputs not found (depth, colour, velocity or render target)");
+        return false;
+    }
+    float scene[kSceneInfoFloats];
+    if (!g.psCb[0].buffer.handle || !ReadCb(g.psCb[0].buffer, g.psCb[0].offset, scene, sizeof(scene))) {
+        Fail("camera constants (SceneInfo) not found");
+        return false;
+    }
+    const resource_desc cd = dev->get_resource_desc(color);
+    const resource_desc td = dev->get_resource_desc(target);
+    uint32_t renderW = cd.texture.width, renderH = cd.texture.height;
+    const float sw = scene[kScreenSize], sh = scene[kScreenSize + 1];
+    if (sw >= 64 && sh >= 64 && sw <= renderW && sh <= renderH) renderW = static_cast<uint32_t>(sw), renderH = static_cast<uint32_t>(sh);
+    g_renderScale = g_outW ? static_cast<float>(renderW) / g_outW : 1.0f;
+
+    std::string err;
+    if (!dlss::Init(reinterpret_cast<ID3D11Device*>(dev->get_native()), err)) {
+        Fail(err);
+        return false;
+    }
+    const bool upscale = g_set.upscale && g_outW && g_outH && renderW < g_outW && renderH < g_outH &&
+                         renderW * 3 + 16 >= g_outW && renderH * 3 + 16 >= g_outH;
+    const uint32_t outW = upscale ? g_outW : td.texture.width, outH = upscale ? g_outH : td.texture.height;
+    if (!Ensure(dev, g_x, outW, outH, format::r16g16b16a16_float, true, "DLSS output")) {
+        Fail("no DLSS output texture");
+        return false;
+    }
+
+    dlss::Inputs in;
+    in.color = reinterpret_cast<ID3D11Resource*>(color.handle);
+    in.depth = reinterpret_cast<ID3D11Resource*>(depth.handle);
+    in.motion = reinterpret_cast<ID3D11Resource*>(motion.handle);
+    in.output = reinterpret_cast<ID3D11Resource*>(g_x.res.handle);
+    in.renderWidth = renderW, in.renderHeight = renderH;
+    in.outputWidth = outW, in.outputHeight = outH;
+    const float jitterX = JitterX(scene, renderW), jitterY = JitterY(scene, renderH);
+    in.jitterX = jitterX, in.jitterY = jitterY;
+    in.motionScaleX = 0.5f * renderW;  // NDC offsets, y up -> render pixels, y down
+    in.motionScaleY = -0.5f * renderH;
+    in.exposure = ExposureOne(dev);
+    in.biasMask = g_set.effectMask && mask.handle ? reinterpret_cast<ID3D11Resource*>(mask.handle) : nullptr;
+    in.reset = CameraCut(scene);
+    in.preset = g_set.preset;
+    if (!dlss::Evaluate(reinterpret_cast<ID3D11DeviceContext*>(cl->get_native()), in, err)) {
+        Fail(err);
+        return false;
+    }
+
+    bool skip;
+    if (upscale) {
+        // The game's TAA still runs at render size (bloom input, history); the passes after it use X.
+        g_up = Up();
+        g_up.active = true;
+        g_up.taaOut = target;
+        skip = false;
+    } else {
+        // DLAA: DLSS's output goes into the TAA target and the game's TAA is skipped.
+        if (!Blit(cl, g_x.srv, g.rtv[0], outW, outH)) {
+            Fail("couldn't copy DLSS's output into the TAA target");
+            return false;
+        }
+        g_up.active = false;
+        skip = true;
+    }
+
+    const std::string mode = upscale ? std::to_string(renderW) + "x" + std::to_string(renderH) + " -> " +
+                                           std::to_string(outW) + "x" + std::to_string(outH)
+                                     : "DLAA " + std::to_string(renderW) + "x" + std::to_string(renderH);
+    std::lock_guard<std::mutex> lock(g_statusMutex);
+    if (!g_runs++ || !g_lastError.empty() || mode != g_mode)
+        Log("DLSS running: %s, jitter %.3f %.3f px%s", mode.c_str(), jitterX, jitterY, in.reset ? ", reset" : "");
+    g_mode = mode;
+    g_lastError.clear();
+    g_lastRun = g_frame + 1;
+    return skip;
+}
+
+// Bloom composite (additive): the game's draw into its TAA output goes into X.
+void OnBloom(command_list* cl, const GameState& g) {
+    if (!g_up.active || g_up.bloomDone || !g_x.rtv.handle || ViewResource(g.rtv[0]) != g_up.taaOut) return;
+    BindTarget(cl, g_x.rtv, g_x.w, g_x.h);
+    g_restorePending = true;
+    g_up.bloomDone = true;
+}
+
+// The tonemap (and the game's sharpening) read t0 by pixel position and SceneInfo's screen size:
+// their draws go to output size with t0 = src and a SceneInfo copy with the output size.
+bool Redirect(command_list* cl, const GameState& g, Texture& src, Texture& dst, const char* name) {
+    device* dev = cl->get_device();
+    const resource target = ViewResource(g.rtv[0]);
+    if (!target.handle || !src.srv.handle) return false;
+    const format fmt = dev->get_resource_desc(target).texture.format;
+    if (!Ensure(dev, dst, src.w, src.h, fmt, false, name)) return false;
+    if (!BindSceneInfoAtOutputSize(cl, g, src.w, src.h)) {
+        Fail(std::string(name) + ": SceneInfo not found");
+        return false;
+    }
+    BindPsSrv(cl, 0, src.srv);
+    BindTarget(cl, dst.rtv, dst.w, dst.h);
+    g_restorePending = true;
+    return true;
+}
+
+void OnTonemap(command_list* cl, const GameState& g) {
+    if (!g_up.active || g_up.tonemapDone) return;
+    if (ViewResource(g.psSrv[0]) != g_up.taaOut) return;
+    const resource out = ViewResource(g.rtv[0]);
+    if (!Redirect(cl, g, g_x, g_y, "tonemapped")) {
+        g_up.active = false;  // the game's own chain for the rest of this frame
+        RestoreGameState(cl);
+        g_restorePending = false;
+        return;
+    }
+    g_up.tonemapDone = true;
+    g_up.tonemapOut = out;
+    g_up.final = &g_y;
+}
+
+void OnSharpen(command_list* cl, const GameState& g) {
+    if (!g_up.active || !g_up.tonemapDone || g_up.sharpenDone || !g_set.sharpen) return;
+    if (ViewResource(g.psSrv[0]) != g_up.tonemapOut) return;
+    const resource out = ViewResource(g.rtv[0]);
+    if (!Redirect(cl, g, g_y, g_z, "sharpened")) return;  // the tonemapped image is used as it is
+    g_up.sharpenDone = true;
+    g_up.sharpenOut = out;
+    g_up.final = &g_z;
+}
+
+// The stretch: the game's draw (its output-size depth), then our output-size image over its colour.
+bool OnStretch(command_list* cl, const GameState& g) {
+    if (!g_up.active || !g_up.final || !g_up.final->srv.handle) return false;
+    const resource src = ViewResource(g.psSrv[kStretchColor]);
+    if (src != (g_up.sharpenDone ? g_up.sharpenOut : g_up.tonemapOut)) return false;
+    Texture& img = *g_up.final;
+    const resource target = ViewResource(g.rtv[0]);
+    const resource_desc td = target.handle ? cl->get_device()->get_resource_desc(target) : resource_desc{};
+    g_up.active = false;
+    if (td.texture.width != img.w || td.texture.height != img.h) {
+        Fail("output target " + std::to_string(td.texture.width) + "x" + std::to_string(td.texture.height) +
+             " isn't the output size: game's upscaling used");
+        return false;
+    }
+    cl->draw(3, 1, 0, 0);  // the game's pass
+    if (!Blit(cl, img.srv, g.rtv[0], img.w, img.h)) Fail("couldn't copy the upscaled image into the output target");
+    return true;
+}
+
+bool g_keyWasDown = false;
+const char* kVersion = RD_VERSION;
+
+}  // namespace
+
+const ImVec4 kWarn(1, 0.6f, 0.3f, 1);
+
+float ControlWidth() { return ImGui::GetFontSize() * 14.0f; }
+
+void Help(const char* text) {
+    ImGui::SameLine();
+    ImGui::TextDisabled("(?)");
+    if (ImGui::IsItemHovered()) ImGui::SetTooltip("%s", text);
+}
+
+void UpscalerInit() {
+    LoadSettings();
+    Log("Upscaling %s at start (F9 toggles)", g_set.enabled ? "on" : "off");
+}
+
+void UpscalerShutdown() { dlss::Shutdown(); }
+
+void UpscalerDestroyDevice(device* dev) {
+    if (dev != g_dev && g_dev) return;
+    g_dev = dev;
+    for (Texture* t : {&g_x, &g_y, &g_z}) Free(*t);
+    if (g_exposureOne.handle) dev->destroy_resource(g_exposureOne);
+    if (g_sceneCb.handle) dev->destroy_resource(g_sceneCb);
+    g_exposureOne = g_sceneCb = {0};
+    if (g_blitVs) g_blitVs->Release();
+    if (g_blitPs) g_blitPs->Release();
+    if (g_cleanState) g_cleanState->Release();
+    g_blitVs = nullptr, g_blitPs = nullptr, g_cleanState = nullptr;
+    dlss::Shutdown();
+    g_dev = nullptr;
+}
+
+void UpscalerBeforeWork(command_list* cl) {
+    if (!g_restorePending) return;
+    g_restorePending = false;
+    RestoreGameState(cl);
+}
+
+bool UpscalerOnDraw(command_list* cl, uint32_t vertices, uint32_t instances) {
+    UpscalerBeforeWork(cl);
+    if (!g_set.enabled || vertices != 3 || instances != 1) return false;
+    GameState g;
+    if (!GetGameState(cl, &g)) return false;
+    if (!g_dev) g_dev = cl->get_device();
+    switch (g.ps) {
+        case kTaaPs: return OnTaa(cl, g);
+        case kBloomPs: OnBloom(cl, g); return false;
+        case kTonemapPs: OnTonemap(cl, g); return false;
+        case kSharpenPs: OnSharpen(cl, g); return false;
+        case kStretchPs: return OnStretch(cl, g);
+        default: return false;
+    }
+}
+
+void UpscalerPresent(command_queue* q, swapchain* sc) {
+    if (g_restorePending) {
+        g_restorePending = false;
+        // (nothing of the game's runs between a redirected draw and the present in practice)
+    }
+    ++g_frame;
+    if (g_up.active) {  // a frame where the chain didn't reach the stretch (menus): nothing redirected now
+        g_up.active = false;
+    }
+    const resource_desc bd = sc->get_device()->get_resource_desc(sc->get_current_back_buffer());
+    if (bd.texture.width != g_outW || bd.texture.height != g_outH) {
+        g_outW = bd.texture.width, g_outH = bd.texture.height;
+        Log("output size %ux%u", g_outW, g_outH);
+    }
+    HWND fg = GetForegroundWindow();
+    DWORD pid = 0;
+    GetWindowThreadProcessId(fg, &pid);
+    const bool down = pid == GetCurrentProcessId() && (GetAsyncKeyState(kToggleHotkey) & 0x8000);
+    if (down && !g_keyWasDown) {
+        g_set.enabled = !g_set.enabled;
+        SaveSettings();
+        Log("Upscaling %s (F9)", g_set.enabled ? "on" : "off");
+    }
+    g_keyWasDown = down;
+    (void)q;
+}
+
+void UpscalerOverlay() {
+    ImGui::Text(RD_PRODUCT " %s", kVersion);
+    bool changed = false;
+    if (ImGui::BeginTabBar("##tabs")) {
+        if (ImGui::BeginTabItem("Settings")) {
+            changed |= ImGui::Checkbox("Upscaling (F9)", &g_set.enabled);
+            Help("DLSS in place of the game's TAA. The render resolution is the game's Image Quality setting: 100% "
+                 "gives DLAA (native resolution), lower values are upscaled to the screen by DLSS.");
+            int idx = 0;
+            for (int i = 0; i < kPresetCount; ++i)
+                if (kPresets[i].value == g_set.preset) idx = i;
+            const char* names[kPresetCount];
+            for (int i = 0; i < kPresetCount; ++i) names[i] = kPresets[i].name;
+            ImGui::SetNextItemWidth(ControlWidth());
+            if (ImGui::Combo("DLSS model", &idx, names, kPresetCount)) {
+                g_set.preset = kPresets[idx].value;
+                changed = true;
+            }
+            Help("Automatic: K at higher render scales, M around 50%, L at 33% (NVIDIA's recommendation).");
+            ImGui::EndTabItem();
+        }
+        if (ImGui::BeginTabItem("Status")) {
+            const bool running = g_lastRun + 2 >= g_frame && g_lastRun;
+            std::string err, mode;
+            {
+                std::lock_guard<std::mutex> lock(g_statusMutex);
+                err = g_lastError, mode = g_mode;
+            }
+            if (!g_set.enabled) ImGui::TextUnformatted("Upscaling off (F9)");
+            else if (running) ImGui::Text("DLSS %s", mode.c_str());
+            else ImGui::TextColored(kWarn, "Not upscaling%s%s", err.empty() ? "" : ": ", err.c_str());
+            ImGui::TextDisabled("DLSS: %s", dlss::Status().c_str());
+            ImGui::TextDisabled("Output %ux%u, render scale %.0f%%", g_outW, g_outH, g_renderScale.load() * 100);
+            ImGui::EndTabItem();
+        }
+        if (ImGui::BeginTabItem("Advanced")) {
+            ImGui::SeparatorText("Image quality");
+            changed |= ImGui::Checkbox("Upscale below 100%", &g_set.upscale);
+            Help("Off: below 100% DLSS anti-aliases at the render resolution and the game stretches the result.");
+            changed |= ImGui::Checkbox("Game's sharpening at output resolution", &g_set.sharpen);
+            Help("The game's own sharpening pass (its Sharpness setting), run on the upscaled image.");
+            changed |= ImGui::Checkbox("Use the game's exposure", &g_set.gameExposure);
+            Help("DLSS is told the colour's exposure instead of estimating it: steadier brightness.");
+            changed |= ImGui::Checkbox("Use the game's effect mask", &g_set.effectMask);
+            Help("The mask the game's TAA uses for particles and effects: DLSS trusts the current frame more there.");
+            ImGui::SeparatorText("Development");
+            changed |= ImGui::Checkbox("Flip jitter X", &g_set.flipJitterX);
+            ImGui::SameLine();
+            changed |= ImGui::Checkbox("Flip jitter Y", &g_set.flipJitterY);
+            Help("Testing only: the sign of the camera jitter given to DLSS. Leave both off.");
+            DrawCaptureTool();
+            ImGui::EndTabItem();
+        }
+        ImGui::EndTabBar();
+    }
+    if (changed) SaveSettings();
+}
+
+}  // namespace rd

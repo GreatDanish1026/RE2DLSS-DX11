@@ -68,5 +68,17 @@ So RE2DLSS's design applies: DLSS in place of PreTonemap2_PS writing an output-s
 bloom composite, tonemap and sharpening redirected to output size, the stretch replaced by a copy.
 psaff99b25 also writes a 4K depth (for the HUD?), to check from its bytecode (added to DumpShaders).
 
-Next (0.1.0): the DLSS path on D3D11 (NGX D3D11 API: no resource states), ported from RE2DLSS's
-upscaler.cpp.
+## 0.1.0 (DLSS, untested)
+
+`src/upscaler.cpp`, `src/dlss.cpp`: RE2DLSS's design on D3D11.
+
+- DLSS through NGX's D3D11 interface, run inside a clean `ID3DDeviceContextState` swapped in and
+  out (`SwapDeviceContextState`), so NGX's bindings never touch the game's. The add-on's own copies
+  (blit.hlsl, with format conversion) run the same way.
+- DLAA (100%): DLSS -> X (rgba16f), drawn into the TAA target; the TAA draw is skipped.
+- Upscaling: DLSS -> X at output size; the game's bloom composite, tonemap and sharpening draws
+  are redirected in place (render target, viewport, scissor, t0, b0 = SceneInfo copy with the
+  output size) and the game's bindings are put back before its next GPU call (D3D11 state
+  persists and the game may not set it again); the stretch draw runs, then Y/Z is drawn over its
+  colour.
+- SceneInfo comes from the CPU's last write to the 512-byte constant buffer bound as b0.
