@@ -1,4 +1,4 @@
-# RE2DLSS-DX11 0.2.0
+# RE2DLSS-DX11 1.0.0
 
 ReShade add-on for the **DirectX 11 version of Resident Evil 2** (the 2019 remake, Steam beta
 branch `dx11_non-rt`, without ray tracing) that replaces the game's TAA with **NVIDIA DLSS** or
@@ -31,7 +31,7 @@ branch `dx11_non-rt`, without ray tracing) that replaces the game's TAA with **N
 
 ## Install
 
-**With Fluffy Mod Manager**: put `RE2DLSS-DX11-0.2.0.zip` in Fluffy Mod Manager's `Games\RE2R\Mods`
+**With Fluffy Mod Manager**: put `RE2DLSS-DX11-1.0.0.zip` in Fluffy Mod Manager's `Games\RE2R\Mods`
 folder (or drag it onto the manager) and enable it. **By hand**: copy the contents of the zip's
 `RE2DLSS-DX11` folder into the game folder (where `re2.exe` is).
 
