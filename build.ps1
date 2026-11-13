@@ -1,9 +1,13 @@
 # Builds bin\RE2DLSS-DX11.addon64 with MSVC (Visual Studio 2022+ with C++ tools).
-# Usage: .\build.ps1 [-Install] [-GameDir <folder of re2.exe>]
-#   -Install  copies the add-on into the game folder (game closed). The game must be on the
-#             Steam beta branch dx11_non-rt.
+# Usage: .\build.ps1 [-Install] [-Package] [-GameDir <folder of re2.exe>]
+#   -Install  copies the add-on, nvngx_dlss.dll and the REFramework script into the game folder
+#             (game closed). The game must be on the Steam beta branch dx11_non-rt.
+#   -Package  makes bin\release\RE2DLSS-DX11-<version>.zip for Fluffy Mod Manager: one folder,
+#             RE2DLSS-DX11, with modinfo.ini and the files as they go in the game folder, including
+#             REFramework's TDB66 build (third_party\reframework\SOURCE.md).
 param(
     [switch]$Install,
+    [switch]$Package,
     [string]$GameDir = "E:\SteamLibrary\steamapps\common\RESIDENT EVIL 2  BIOHAZARD RE2"
 )
 $ErrorActionPreference = 'Stop'
@@ -51,4 +55,50 @@ if ($Install) {
         Copy-Item "$root\reframework\$name.lua" "$GameDir\reframework\autorun" -Force
     } else { Write-Warning "REFramework not installed: the render resolution dropdown needs it" }
     Write-Host "Installed to $GameDir"
+}
+
+if ($Package) {
+    $refw = "$root\third_party\reframework\dinput8.dll"
+    if (-not (Test-Path $ngx)) { throw "nvngx_dlss.dll not found in third_party\bin" }
+    if (-not (Test-Path $refw)) { throw "dinput8.dll not found in third_party\reframework (see SOURCE.md there)" }
+    $version = [regex]::Match((Get-Content "$root\src\version.h" -Raw), 'RD_VERSION "([^"]+)"').Groups[1].Value
+    $stage = "$root\bin\release\$name-$version"
+    $mod = "$stage\$name"
+    if (Test-Path $stage) { Remove-Item $stage -Recurse -Force }
+    New-Item -ItemType Directory -Force "$mod\reframework\autorun", "$mod\$name-licenses" | Out-Null
+
+    # Files installed into the game folder (where re2.exe is).
+    Copy-Item $addon, $ngx, $refw $mod
+    Copy-Item "$root\reframework\$name.lua" "$mod\reframework\autorun"
+    Copy-Item "$root\README.md" "$mod\$name-README.md"
+    Copy-Item "$root\THIRD_PARTY_NOTICES.txt" "$mod\$name-THIRD_PARTY_NOTICES.txt"
+    Copy-Item "$root\LICENSE" "$mod\$name-licenses\$name-LICENSE.txt"
+    Copy-Item "$root\third_party\dlss\LICENSE.txt" "$mod\$name-licenses\NVIDIA-DLSS-LICENSE.txt"
+    Copy-Item "$root\third_party\reshade\LICENSE.md" "$mod\$name-licenses\ReShade-LICENSE.md"
+    Copy-Item "$root\third_party\reframework\LICENSE.txt" "$mod\$name-licenses\REFramework-LICENSE.txt"
+
+    # Fluffy Mod Manager's mod information (key=value, one per line).
+    @(
+        "name=$name - DLSS for Resident Evil 2 (DirectX 11 version)",
+        "version=v$version",
+        "description=For the DirectX 11 (non-ray-tracing) version of Resident Evil 2 (Steam beta branch dx11_non-rt). Replaces the game's TAA with NVIDIA DLSS: native anti-aliasing (DLAA), or upscaling with the game's bloom, tonemapping (RenoDX HDR works), sharpening and HUD at full resolution. Includes REFramework (TDB66 build) for the render resolution dropdown. Needs an NVIDIA RTX card and ReShade 6.8+ with add-on support. Settings: ReShade overlay (Home), Add-ons tab, $name; F9 switches DLSS on and off.",
+        "author=Scott Dinwiddie"
+    ) | Set-Content "$mod\modinfo.ini" -Encoding ascii
+
+    # Zip with forward-slash entry names (Compress-Archive in PowerShell 5.1 writes backslashes).
+    Add-Type -AssemblyName System.IO.Compression, System.IO.Compression.FileSystem
+    $zip = "$root\bin\release\$name-$version.zip"
+    if (Test-Path $zip) { Remove-Item $zip -Force }
+    $archive = [IO.Compression.ZipFile]::Open($zip, [IO.Compression.ZipArchiveMode]::Create)
+    try {
+        Get-ChildItem $stage -Recurse -File | ForEach-Object {
+            $entry = $_.FullName.Substring($stage.Length + 1).Replace('\', '/')
+            [void][IO.Compression.ZipFileExtensions]::CreateEntryFromFile($archive, $_.FullName, $entry,
+                [IO.Compression.CompressionLevel]::Optimal)
+        }
+    } finally { $archive.Dispose() }
+    Write-Host "Packaged $zip"
+    Get-ChildItem $stage -Recurse -File | ForEach-Object {
+        "{0,-60} {1,12:N0}" -f $_.FullName.Substring($stage.Length + 1), $_.Length
+    }
 }
