@@ -36,6 +36,37 @@ The post chain matches the DX12 build's (RE2DLSS docs/FINDINGS.md), with new sha
 Same TAA registers as the DX12 build (t0 mask, t1 depth, t2 colour, t3 history, t4 velocity).
 No motion blur pass in this capture (motion blur is likely off in these settings).
 
-Next: capture 2 at about 50% Image Quality with RenoDX off and DumpShaders set (TAA, tonemap,
-psff2662f2, ps83760deb, bloom composite, compose, output, VS), to see how the render size is
-upscaled in this build and to read the jitter and velocity conventions.
+## Capture 2 (2026-11-13: Image Quality 50%, 1920x1080 -> 3840x2160, RenoDX off, game HDR on)
+
+`docs/captures/RE2DLSS-DX11-frame-2-50pct.txt`, bytecode + `fxc /dumpbin` in `docs/shaders`.
+Without RenoDX the scene targets are r11g11b10f (RenoDX upgrades them to rgba16f); shader ids are
+the same either way.
+
+Everything up to the sharpening runs at render size; one pass then stretches to output size:
+
+| Pass | Shader (entry names from RDEF) | Reads | Writes |
+|---|---|---|---|
+| **TAA** | **psddfad309** = PreTonemap2_PS | t0 EffectMaskTex, t1 ReadonlyDepth, t2 HDRImage, t3 PrevHDRImage, t4 Velocity; cb0 SceneInfo, cb1 Tonemap (AABlend, ResponsiveAARate, preTonemapRange) | render size |
+| bloom + composite | pseb1e43cf .. ps629a5b35 | TAA output | into TAA output |
+| **tonemap** | **ps81003188** | t0 | render size |
+| **sharpen** | **psff2662f2** (5-tap, Tonemap.sharpness) | t0 tonemapped | render size |
+| **stretch** | **psaff99b25** (vsa60b7c3f) | t0 depth, t1 sharpened, SceneInfo | **output size** colour + d32f depth |
+| (at 100%: plain copy) | ps83760deb (`ld` by pixel) | | |
+| HUD | ps5c43bdb5 | | output size |
+| output | psb106fe94 (HDRMapping: PQ encode) | | back buffer rgb10a2 |
+
+TAA maths identical to the DX12 build's PreTonemap2_PS: colour x Exposure (VS output: WhitePtSrv x
+exposureAdjustment), unjittered by `projElement[0].zw * screenInverseSize * 0.5`, prevUV = uv +
+(v.x * 0.5, -v.y * 0.5), output divided by Exposure again.
+
+SceneInfo (cb0, 512 bytes here, 528 in the DX12 build) has the DX12 layout at the offsets
+RE2DLSS uses: projElement[0] at byte 160 (x scale, y scale, **jitter x, y in clip space**), screenSize
+at 368 (1920 1080 = render size), cameraNearPlane at 392. Jitter in this frame: -0.000228, 0.000360
+clip = 0.22, 0.19 render pixels.
+
+So RE2DLSS's design applies: DLSS in place of PreTonemap2_PS writing an output-size image, the
+bloom composite, tonemap and sharpening redirected to output size, the stretch replaced by a copy.
+psaff99b25 also writes a 4K depth (for the HUD?), to check from its bytecode (added to DumpShaders).
+
+Next (0.1.0): the DLSS path on D3D11 (NGX D3D11 API: no resource states), ported from RE2DLSS's
+upscaler.cpp.
