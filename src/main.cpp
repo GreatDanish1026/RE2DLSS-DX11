@@ -329,7 +329,7 @@ std::unordered_map<uint64_t, void*> g_mapped;
 // SceneInfo (512 bytes) always; other constant buffers only while shaders are in the dump list.
 bool TrackCb(const resource_desc& desc) {
     if (desc.type != resource_type::buffer || (desc.usage & resource_usage::constant_buffer) == 0) return false;
-    if (desc.buffer.size == 512) return true;
+    if (desc.buffer.size == 512 || desc.buffer.size == 256) return true;  // SceneInfo, Tonemap
     return desc.buffer.size <= 4096 && !(g_dumpPs.empty() && g_dumpCs.empty());
 }
 

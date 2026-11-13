@@ -426,6 +426,33 @@ ID3D11Resource* GameExposure(command_list* cl, const GameState& g) {
     ctx1->Release();
     static bool logged = false;
     if (!logged) logged = true, Log("DLSS exposure: the game's (auto-exposure x exposureAdjustment, computed on the GPU)");
+
+    // Every ~10 s: the value, read back a few frames later without stalling (for the log).
+    static ID3D11Texture2D* staging = nullptr;
+    static uint64_t copiedAt = 0;
+    static int reads = 0;
+    if (!staging) {
+        D3D11_TEXTURE2D_DESC d = {1, 1, 1, 1, DXGI_FORMAT_R32_FLOAT, {1, 0}, D3D11_USAGE_STAGING, 0, D3D11_CPU_ACCESS_READ, 0};
+        d3d->CreateTexture2D(&d, nullptr, &staging);
+    }
+    if (staging && reads < 30) {
+        if (!copiedAt && g_frame % 600 == 0) {
+            ctx->CopyResource(staging, g_exposureTex);
+            copiedAt = g_frame;
+        } else if (copiedAt && g_frame > copiedAt + 3) {
+            D3D11_MAPPED_SUBRESOURCE m;
+            if (SUCCEEDED(ctx->Map(staging, 0, D3D11_MAP_READ, D3D11_MAP_FLAG_DO_NOT_WAIT, &m))) {
+                const float e = *static_cast<const float*>(m.pData);
+                ctx->Unmap(staging, 0);
+                float tm[8] = {};
+                const bool tmOk = ReadCb(cb.buffer, cb.offset, tm, sizeof(tm));
+                Log("game exposure now %.5f (exposureAdjustment %.5f, useAutoExposure %d)", e, tmOk ? tm[0] : -1.0f,
+                    tmOk ? *reinterpret_cast<int*>(&tm[4]) : -1);
+                copiedAt = 0;
+                ++reads;
+            }
+        }
+    }
     return g_exposureTex;
 }
 

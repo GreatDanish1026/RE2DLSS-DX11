@@ -37,7 +37,7 @@ void RestoreGameState(reshade::api::command_list* cl);
 
 // The resource a view was created for (from the add-on's own map).
 reshade::api::resource ViewResource(reshade::api::resource_view view);
-// A 512-byte constant buffer's contents as the CPU last wrote them (SceneInfo).
+// A 512- or 256-byte constant buffer's contents as the CPU last wrote them (SceneInfo, Tonemap).
 bool ReadCb(reshade::api::resource buffer, uint64_t offset, void* out, size_t size);
 
 // Overlay helpers (upscaler.cpp).
