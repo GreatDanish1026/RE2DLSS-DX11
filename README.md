@@ -65,6 +65,8 @@ ReShade overlay (Home key), Add-ons tab, **RE2DLSS-DX11**; saved in `ReShade.ini
 
 - Not supported: frame generation, and Ray Reconstruction (this version of the game has no ray
   tracing).
+- If the NVIDIA app's DLSS override (model preset) is set, the driver uses that model whatever the
+  DLSS model setting here says.
 - `RE2DLSS-DX11.log` next to `re2.exe` records what the add-on found and did.
 
 ## Licence
