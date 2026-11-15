@@ -149,3 +149,12 @@ each applied within a fraction of a second. The game's post chain format changes
   DLSS turned the character's dithered fade see-through; DLSS's own auto-exposure doesn't (user).
   GameExposure is now off by default. The sampler-reuse fix stays (a real bug, not this one).
   Bloom with the scaled-down DLSS image as its input: "acceptable in its improvement" (user).
+
+## 1.1.0: fixes from RE3DLSS-DX11 (2026-11-15)
+
+RE3's DX11 build is the same engine build with the same shaders. Testing it found that the game's
+velocity includes this frame's jitter, which made DLSS leave soft striped patches on still faces at
+Performance. Ported from RE3DLSS-DX11 1.0.0: motion vectors with the jitter taken out (mvfix.hlsl,
+rg16f, for DLSS and FSR), the longer jitter sequence (SceneInfo patched to 8 / scale^2 Halton
+positions while upscaling), and the DLSS mode picked by the closest optimal render size. Details in
+RE3DLSS-DX11's docs/FINDINGS.md.

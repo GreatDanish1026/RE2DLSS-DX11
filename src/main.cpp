@@ -371,6 +371,8 @@ void OnUnmapBuffer(device*, resource r) {
     auto m = g_mapped.find(r.handle);
     if (m == g_mapped.end()) return;
     std::vector<uint8_t>& v = g_cbData[r.handle];
+    // SceneInfo: the jitter is replaced before the GPU sees it (upscaler.cpp, longer sequence).
+    if (v.size() == 512) rd::PatchSceneInfo(static_cast<float*>(m->second));
     memcpy(v.data(), m->second, v.size());
     g_mapped.erase(m);
 }
@@ -380,6 +382,10 @@ void CopyCb(resource r, const void* data, uint64_t offset, uint64_t size) {
     std::lock_guard<std::mutex> lock(g_resMutex);
     auto it = g_cbData.find(r.handle);
     if (it == g_cbData.end() || offset >= it->second.size()) return;
+    // SceneInfo written with UpdateSubresource: the game's source data is patched in place (it
+    // writes it again every frame).
+    if (it->second.size() == 512 && offset == 0 && (size == UINT64_MAX || size >= 512))
+        rd::PatchSceneInfo(const_cast<float*>(static_cast<const float*>(data)));
     if (size == UINT64_MAX || offset + size > it->second.size()) size = it->second.size() - offset;
     memcpy(it->second.data() + offset, data, static_cast<size_t>(size));
 }

@@ -27,6 +27,7 @@ struct Inputs {
     ID3D11Resource* exposure = nullptr;  // 1x1, null: DLSS's auto-exposure
     ID3D11Resource* biasMask = nullptr;  // r8, 1 = trust this frame (particles, effects)
     int preset = 0;                      // NVSDK_NGX_DLSS_Hint_Render_Preset_*, or kPresetAuto
+    bool mvJittered = false;             // the motion vectors include the jitter
 };
 
 // Loads NGX for the device (once). False with a reason if DLSS can't run.

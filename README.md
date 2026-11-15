@@ -1,4 +1,4 @@
-# RE2DLSS-DX11 1.0.0
+# RE2DLSS-DX11 1.1.0
 
 ReShade add-on for the **DirectX 11 version of Resident Evil 2** (the 2019 remake, Steam beta
 branch `dx11_non-rt`, without ray tracing) that replaces the game's TAA with **NVIDIA DLSS** or
@@ -15,6 +15,10 @@ branch `dx11_non-rt`, without ray tracing) that replaces the game's TAA with **N
   between the two; on Radeon cards that support it, AMD's runtime picks FSR 4.
 - **DLSS model**: Automatic (K at Native, Quality and Balanced, M at Performance), or K, J, L or M.
   Changing the render resolution in the overlay sets it back to Automatic.
+- **Clean upscaling at low resolutions** (1.1.0): the game's motion vectors include each frame's
+  camera jitter; the add-on takes it out before DLSS and FSR get them (with it, DLSS leaves soft
+  striped patches on still faces at Performance), and gives the game a longer jitter sequence while
+  upscaling (32 positions at Performance instead of the game's 16), as DLSS asks for.
 - **Sharpening** slider (off by default): AMD's contrast-adaptive sharpening (RCAS) after DLSS, or
   FSR's own for FSR.
 - **Sharper textures** (on by default): when upscaling, textures are sampled as at your screen
@@ -31,7 +35,7 @@ branch `dx11_non-rt`, without ray tracing) that replaces the game's TAA with **N
 
 ## Install
 
-**With Fluffy Mod Manager**: put `RE2DLSS-DX11-1.0.0.zip` in Fluffy Mod Manager's `Games\RE2R\Mods`
+**With Fluffy Mod Manager**: put `RE2DLSS-DX11-1.1.0.zip` in Fluffy Mod Manager's `Games\RE2R\Mods`
 folder (or drag it onto the manager) and enable it. **By hand**: copy the contents of the zip's
 `RE2DLSS-DX11` folder into the game folder (where `re2.exe` is).
 
@@ -53,8 +57,9 @@ ReShade overlay (Home key), Add-ons tab, **RE2DLSS-DX11**; saved in `ReShade.ini
 - **Status**: what's running (upscaler, render size, native or upscaling), or why it isn't.
 - **Advanced**: upscaling below 100% (off: the upscaler anti-aliases at the render resolution and
   the game stretches the result), the game's sharpening at full resolution, the game's effect mask,
-  sharper textures, the game's exposure for DLSS (off by default: it made characters' dithered fade
-  look see-through), and a frame capture tool for development.
+  the longer jitter sequence, sharper textures, the game's exposure for DLSS (off by default: it made
+  characters' dithered fade look see-through), and testing switches and a frame capture tool for
+  development.
 
 ## Notes
 

@@ -34,6 +34,7 @@ struct Feature {
     unsigned renderW = 0, renderH = 0, outW = 0, outH = 0;
     int preset = -1;
     bool autoExposure = true;
+    bool mvJittered = false;
 } g_feature;
 
 void NVSDK_CONV NgxLog(const char* message, NVSDK_NGX_Logging_Level, NVSDK_NGX_Feature) {
@@ -60,11 +61,16 @@ const char* QualityName(NVSDK_NGX_PerfQuality_Value q) {
     }
 }
 
+// The DLSS mode whose optimal render size is closest to the game's, among those whose supported
+// range holds it. (The first mode whose range holds it, as before, named every scale down to 50%
+// "Quality": the ranges overlap.)
 NVSDK_NGX_PerfQuality_Value PickQuality(unsigned renderW, unsigned renderH, unsigned outW, unsigned outH) {
     if (renderW >= outW && renderH >= outH) return NVSDK_NGX_PerfQuality_Value_DLAA;
     const NVSDK_NGX_PerfQuality_Value order[] = {
-        NVSDK_NGX_PerfQuality_Value_DLAA,    NVSDK_NGX_PerfQuality_Value_UltraQuality, NVSDK_NGX_PerfQuality_Value_MaxQuality,
-        NVSDK_NGX_PerfQuality_Value_Balanced, NVSDK_NGX_PerfQuality_Value_MaxPerf,      NVSDK_NGX_PerfQuality_Value_UltraPerformance};
+        NVSDK_NGX_PerfQuality_Value_UltraQuality, NVSDK_NGX_PerfQuality_Value_MaxQuality, NVSDK_NGX_PerfQuality_Value_Balanced,
+        NVSDK_NGX_PerfQuality_Value_MaxPerf,      NVSDK_NGX_PerfQuality_Value_UltraPerformance};
+    NVSDK_NGX_PerfQuality_Value best = NVSDK_NGX_PerfQuality_Value_MaxQuality;
+    unsigned bestDiff = UINT32_MAX;
     for (NVSDK_NGX_PerfQuality_Value q : order) {
         unsigned optW = 0, optH = 0, maxW = 0, maxH = 0, minW = 0, minH = 0;
         float sharp = 0;
@@ -72,9 +78,11 @@ NVSDK_NGX_PerfQuality_Value PickQuality(unsigned renderW, unsigned renderH, unsi
                                                            &sharp)) ||
             !optW)
             continue;
-        if (renderW >= minW && renderW <= maxW && renderH >= minH && renderH <= maxH) return q;
+        if (renderW < minW || renderW > maxW || renderH < minH || renderH > maxH) continue;
+        const unsigned diff = optW > renderW ? optW - renderW : renderW - optW;
+        if (diff < bestDiff) bestDiff = diff, best = q;
     }
-    return NVSDK_NGX_PerfQuality_Value_MaxQuality;
+    return best;
 }
 
 // The model for Automatic, by render scale: K down to Balanced (58%), M around Performance (50%),
@@ -101,13 +109,15 @@ bool CreateFeature(ID3D11DeviceContext* context, const Inputs& in, std::string& 
     cp.Feature.InPerfQualityValue = q;
     cp.InFeatureCreateFlags = NVSDK_NGX_DLSS_Feature_Flags_IsHDR | NVSDK_NGX_DLSS_Feature_Flags_MVLowRes |
                               NVSDK_NGX_DLSS_Feature_Flags_DepthInverted |
-                              (in.exposure ? 0 : NVSDK_NGX_DLSS_Feature_Flags_AutoExposure);
+                              (in.exposure ? 0 : NVSDK_NGX_DLSS_Feature_Flags_AutoExposure) |
+                              (in.mvJittered ? NVSDK_NGX_DLSS_Feature_Flags_MVJittered : 0);
     const NVSDK_NGX_Result r = NGX_D3D11_CREATE_DLSS_EXT(context, &g_feature.handle, g_params, &cp);
     if (NVSDK_NGX_FAILED(r)) {
         g_feature.handle = nullptr;
         error = "DLSS feature creation failed (" + ResultText(r) + ")";
         return false;
     }
+    g_feature.mvJittered = in.mvJittered;
     g_feature.renderW = in.renderWidth, g_feature.renderH = in.renderHeight;
     g_feature.outW = in.outputWidth, g_feature.outH = in.outputHeight;
     g_feature.preset = in.preset, g_feature.autoExposure = !in.exposure;
@@ -205,7 +215,8 @@ bool Evaluate(ID3D11DeviceContext* context, const Inputs& requested, std::string
     bool ok = true;
     const bool fresh = !g_feature.handle || in.renderWidth != g_feature.renderW || in.renderHeight != g_feature.renderH ||
                        in.outputWidth != g_feature.outW || in.outputHeight != g_feature.outH ||
-                       in.preset != g_feature.preset || g_feature.autoExposure != !in.exposure;
+                       in.preset != g_feature.preset || g_feature.autoExposure != !in.exposure ||
+                       g_feature.mvJittered != in.mvJittered;
     if (fresh && !CreateFeature(context, in, error)) ok = false;
     if (ok) {
         NVSDK_NGX_D3D11_DLSS_Eval_Params ep = {};

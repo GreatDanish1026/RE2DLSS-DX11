@@ -40,6 +40,10 @@ reshade::api::resource ViewResource(reshade::api::resource_view view);
 // A 512- or 256-byte constant buffer's contents as the CPU last wrote them (SceneInfo, Tonemap).
 bool ReadCb(reshade::api::resource buffer, uint64_t offset, void* out, size_t size);
 
+// A 512-byte SceneInfo the CPU is writing (before the GPU reads it): the main view's jitter is
+// replaced by the add-on's longer sequence (upscaler.cpp). Called with main.cpp's g_resMutex held.
+void PatchSceneInfo(float* scene);
+
 // Overlay helpers (upscaler.cpp).
 float ControlWidth();
 void Help(const char* text);
